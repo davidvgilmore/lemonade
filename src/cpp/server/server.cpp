@@ -1,5 +1,6 @@
 #include "lemon/server.h"
 #include "lemon/api_docs.h"
+#include "lemon/arc_router.h"
 #include "lemon/audio_types.h"
 #include "lemon/auto_tune.h"
 #include "lemon/error_types.h"
@@ -22,6 +23,7 @@
 #include "lemon/model_types.h"
 #include <cstring>
 #include "lemon/utils/conversation_fingerprint.h"
+#include "lemon/utils/http_client.h"
 #include "lemon/utils/image_sniff.h"
 #include "lemon/utils/json_utils.h"
 #include "lemon/utils/model_name_utils.h"
@@ -86,6 +88,14 @@
 namespace fs = std::filesystem;
 
 namespace lemon {
+
+static json call_arc_worker(const std::string& endpoint, const json& request) {
+    auto response = utils::HttpClient::post(endpoint, request.dump(),
+        {{"Content-Type", "application/json"}}, 120,
+        utils::HttpSecurityPolicy::TrustedLoopback, WrappedServer::current_request_cancel_context());
+    arc_require(response.status_code == 200, "ARC worker refused the decision request");
+    return json::parse(response.body);
+}
 
 namespace {
 
@@ -3680,6 +3690,22 @@ std::optional<RouterDispatchResult> Server::route_collection_request(
         return std::nullopt;
     }
 
+    if (collection_info.route_policy->arc_router) {
+        try {
+            const auto& config = *collection_info.route_policy->arc_router;
+            Decision decision = route_arc(config, arc_request_from_chat(request_json), call_arc_worker);
+            RouterDispatchResult result;
+            result.requested_model = collection_info.model_name;
+            result.selected_model = decision.route_to;
+            result.decision = std::move(decision);
+            return result;
+        } catch (const ArcRoutingError&) {
+            throw;
+        } catch (const std::exception&) {
+            throw ArcRoutingError("Invalid ARC context");
+        }
+    }
+
     // The engine owns its policy (and is rebuilt per request because its
     // classifier services are bound to the live Router), so copy the shared,
     // immutable policy into it.
@@ -3777,6 +3803,14 @@ void Server::handle_routing_validate(const httplib::Request& req, httplib::Respo
         RoutePolicy policy = parse_route_policy_collection(
             request_json["policy"], options, &normalized_routing);
 
+        if (policy.arc_router) {
+            arc_require(request_json.contains("arc_request"), "ARC validation requires a complete arc_request");
+            Decision decision = route_arc(*policy.arc_router, request_json.at("arc_request"), call_arc_worker);
+            res.set_content(json{{"decision", route_decision_to_json(decision)},
+                                 {"normalized_policy", request_json.at("policy")}}.dump(), "application/json");
+            return;
+        }
+
         ClassifierServices services = make_router_classifier_services(
             *router_, [this](const std::string& m) {
                 auto_load_model_if_needed(m, json::object(),
@@ -3839,9 +3873,12 @@ std::optional<RouterDispatchResult> Server::apply_router_collection_dispatch(
         dispatch->requested_model = requested_model;
         LOG(INFO, "Server") << "Router collection '" << requested_model << "' -> '"
                             << dispatch->selected_model << "'" << std::endl;
+        apply_arc_dispatch(request_json, dispatch->decision);
         request_json["model"] = dispatch->selected_model;
         request_json.erase("route_trace");
         return dispatch;
+    } catch (const ArcRoutingError&) {
+        throw;
     } catch (const RouterResidencyConflictException&) {
         // This is a deterministic hardware-policy conflict, not a routing miss.
         // Let the endpoint serialize it as HTTP 409 instead of silently falling
@@ -3936,11 +3973,16 @@ void Server::handle_chat_completions(const httplib::Request& req, httplib::Respo
                             route_dispatch->requested_model = requested_model;
                             LOG(INFO, "Server") << "Router collection '" << requested_model
                                                 << "' -> '" << route_dispatch->selected_model << "'" << std::endl;
+                            apply_arc_dispatch(request_json, route_dispatch->decision);
                             request_json["model"] = route_dispatch->selected_model;
                             request_json.erase("route_trace");
                         }
                     }
                 }
+            } catch (const ArcRoutingError& e) {
+                res.status = 502;
+                res.set_content(json{{"error", {{"message", e.what()}, {"type", "arc_routing_error"}}}}.dump(), "application/json");
+                return;
             } catch (const RouterResidencyConflictException& e) {
                 LOG(WARNING, "Server") << "Router residency conflict for '"
                                        << requested_model << "': " << e.what() << std::endl;

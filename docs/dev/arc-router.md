@@ -1,0 +1,118 @@
+# ARC policy worker integration (experimental)
+
+ARC is a decision policy, not a text generator. The `collection.router` ARC
+adapter calls a separately launched local worker that owns encoder and head
+inference. It uses the existing
+`POST /v1/rayline/arc/policy/decide` contract. No ARC implementation, credentials,
+weights, or release-specific configuration are bundled in Lemonade.
+
+## Design choice
+
+Three extension shapes were considered:
+
+- A `WrappedServer` backend would fit subprocess lifecycle and model management,
+  but its generation interface does not represent a structured policy decision.
+  A backend implementation alone cannot install a routing policy.
+- A classifier could reuse first-match rules, but the current classifier input
+  is the latest user text. ARC needs message/tool history, attribution, eligible
+  actions, session context, and package identity. Turning a hierarchical action
+  into classifier scores would discard that contract.
+- A typed `routing.router` branch preserves the existing collection registration,
+  candidate resolution, route trace, and dispatch paths. The adapter remains
+  independent of the worker's tensor implementation. This is the implemented
+  option; it is a compiled Lemonade extension, not a stock runtime plugin.
+
+The worker remains an external process, consistent with Lemonade's subprocess
+inference invariant. This first integration does not install or supervise it.
+Only numeric IPv4 loopback is accepted; HTTP redirects are disabled. Requests
+use a bounded timeout and inherit chat request cancellation.
+
+## Policy configuration
+
+Use an ordinary `collection.router` collection with `routing.candidates` and
+`routing.default_model`, then an ARC router instead of rules/classifiers:
+
+```json
+{
+  "type": "arc",
+  "endpoint": "http://127.0.0.1:18081/v1/rayline/arc/policy/decide",
+  "package": {
+    "alias": "operator-configured-package",
+    "package_sha256": "<exact 64-character manifest SHA256>"
+  },
+  "actions": {
+    "<opaque 64-character action ID>": {
+      "model": "registered-candidate",
+      "reasoning_effort": "high",
+      "reasoning_max_tokens": null,
+      "steering_suffix": ""
+    }
+  }
+}
+```
+
+The placeholders above must be replaced from the pinned package catalog.
+Each eligible action needs a destination binding. Several actions can map to
+one destination with different native reasoning efforts. The binding is operator
+configuration; the worker response cannot supply arbitrary request overrides.
+
+A wrong package, wrong schema, unavailable worker, or action outside the request's
+eligible set fails closed. ARC never falls through to `default_model` after an
+inference failure. The default remains required by the collection schema.
+
+## Decision-only validation
+
+Submit `{ "policy": <collection>, "arc_request": <complete decision request> }`
+to `/api/v1/routing/validate`. The full existing ARC envelope is forwarded without
+rewriting its history, format, attribution, selection, or session fields. The
+response's `decision.outputs.arc` contains the worker response unchanged,
+including encoding diagnostics, action scores, and selection reason. This path
+does not register the collection, load a target model, or generate an answer.
+The other standard endpoint prefixes also work.
+
+This is the preferred numerical-parity acceptance path: supply the same pinned
+package, input, selection, session trajectory, and attribution used by the
+reference service; compare selected action/arm and encoding/score diagnostics
+under the release's stated tolerances. A successful adapter round trip alone
+does not establish numerical parity or local model execution. Establish those
+separately from the actual worker's runtime/artifact evidence.
+
+## Chat dispatch
+
+Register the collection through `/api/v1/pull` and address its name in a chat
+completion. Include `arc_context`, containing the normal decision-request
+envelope **except `request`**. It must explicitly provide schema, pinned package,
+`request_format: "openai_chat"`, episode hash, context epoch, attribution, and
+selection. The adapter builds the worker's `request` from the original
+`system`, `tools`, and `messages` fields. It never substitutes another message
+history or invents attribution. Generation controls remain on the original
+request; they are not part of the worker's input schema.
+
+After selection, Lemonade applies the configured `reasoning_effort`, strips
+`arc_context`, and dispatches normally. With `route_trace: true`, the raw worker
+result appears in `x_lemonade_route.outputs.arc`. Native controls are not
+inferred from a model name.
+
+The current dispatch adapter supports OpenAI chat and native `reasoning_effort`.
+Nonempty steering suffixes and reasoning budgets are rejected at policy load:
+their provider-specific encoding must be implemented and tested before those
+actions can be dispatched. Conflicting incoming `thinking`, `reasoning`,
+`reasoning_max_tokens`, and `chat_template_kwargs` are rejected. Responses,
+Anthropic, and completions dispatch are not implemented; decision-only
+validation can forward any format accepted by the worker.
+
+## Verification
+
+```sh
+cmake -S . -B build -G Ninja -DBUILD_WEB_APP=OFF -DBUILD_TESTING=ON
+cmake --build build --target lemond test_arc_router test_routing_policy_parser test_routing_policy_llm_router
+ctest --test-dir build -R 'ArcRouterTest|RoutingPolicyParserTest|RoutingPolicyLlmRouterTest' --output-on-failure
+# Start an isolated lemond before this command; follow test/requirements.txt.
+LEMONADE_TEST_PORT=18305 python test/server_arc.py
+```
+
+The Python test uses the repository's server test base, a synthetic worker, and a
+mock provider. It checks the real HTTP validation path, collection registration,
+model/effort delivery, unchanged messages, and fail-closed rejection. No private
+artifacts or paid provider requests are needed. Private release parity fixtures
+and results belong outside this public repository.

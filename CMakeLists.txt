@@ -3455,3 +3455,15 @@ if(BUILD_TESTING AND EXISTS "${_MODEL_SYNC_TEST_SRC}")
     include(CTest)
     add_cpp_ci_test(ModelSyncAndAutoUpdateTest CI ON COMMAND test_model_sync_and_auto_update)
 endif()
+
+if(BUILD_TESTING)
+    add_executable(test_arc_router
+        test/cpp/test_arc_router.cpp
+        src/cpp/server/routing_policy.cpp
+        src/cpp/server/routing_policy_parser.cpp)
+    target_include_directories(test_arc_router PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/src/cpp/include
+        ${CMAKE_CURRENT_BINARY_DIR}/include)
+    target_link_libraries(test_arc_router PRIVATE nlohmann_json::nlohmann_json)
+    add_cpp_ci_test(ArcRouterTest CI ON COMMAND test_arc_router)
+endif()
