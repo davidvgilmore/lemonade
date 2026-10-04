@@ -118,3 +118,40 @@ mock provider. It checks the real HTTP validation path, collection registration,
 model/effort delivery, unchanged messages, and fail-closed rejection. No private
 artifacts or paid provider requests are needed. Private release parity fixtures
 and results belong outside this public repository.
+
+## Desktop and CLI setup
+
+In the desktop app, create a **Hybrid Router**, choose **ARC**, and import the
+collection setup exported by your ARC runtime. Select the corresponding
+candidate models, then save. Existing ARC collections open in ARC mode; editing
+and exporting retains the complete action bindings, including controls that are
+only supported for decision testing. A changed candidate selection must still
+contain every bound destination.
+
+The **Test Prompt** tab accepts a saved ARC decision request and tests it against
+the local runtime. The result is a selected destination, without a downstream
+model call. This checks connectivity and the supplied conversation; it does not
+qualify a model release against reference outputs. Conversation files can
+contain private inputs, so keep them outside source control.
+
+The existing CLI uses the same collection format:
+
+```sh
+lemonade import arc-router.json
+lemonade export user.MyArcRouter --output arc-router-export.json
+```
+
+Use `lemonade --help` for the server connection options on your installation.
+Import registers a router; it does not install the separate ARC runtime or
+establish numerical parity. Start that runtime with access to the pinned release
+before testing. For a private Hugging Face release, give the runtime its existing
+Hugging Face credentials (`HF_TOKEN` or its supported local login). Never put
+credentials in the collection JSON. Lemonade's own model download credentials
+are separate from the ARC runtime's process environment.
+
+The router appears in the normal model picker. Desktop chat currently cannot
+supply the required ARC conversation context by itself. API clients must supply
+`arc_context`; action sets requiring steering or budgets are rejected for chat.
+The local decision test supports those catalog controls without dispatching
+anything. Full ordinary-chat support requires the shared runtime's session and
+steering lifecycle integration and remains unfinished.

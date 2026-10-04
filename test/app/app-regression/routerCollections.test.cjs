@@ -1473,4 +1473,25 @@ const tests = [
 
 ];
 
+tests.push({
+  name: 'ARC setup round-trip preserves action controls and rejects broken candidate bindings',
+  run() {
+    const action = 'a'.repeat(64);
+    const routing = {
+      candidates: ['Model-A'], default_model: 'Model-A',
+      router: { type: 'arc', endpoint: 'http://127.0.0.1:9011/v1/rayline/arc/policy/decide',
+        package: { alias: 'synthetic', package_sha256: 'b'.repeat(64) },
+        actions: { [action]: { model: 'Model-A', reasoning_effort: null, reasoning_max_tokens: null, steering_suffix: 'synthetic instruction' } } },
+    };
+    const draft = parse('user.Arc', routing, ['Model-A']);
+    assert.equal(draft.routingMode, 'arc');
+    assert.equal(collectionUtils.validateRouterDraftStructure(draft), null);
+    assert.deepEqual(build(draft).routing, routing);
+    assert.deepEqual(validateImport(build(draft)).routing, routing);
+    const changed = { ...draft, candidates: ['Model-B'], defaultModel: 'Model-B' };
+    assert.match(collectionUtils.validateRouterDraftStructure(changed), /selected candidate/);
+    assert.throws(() => build(changed), /selected candidate/);
+    assert.match(collectionUtils.validateRouterDraftStructure({ ...draft, arcRouter: { ...draft.arcRouter, endpoint: 'https://external.example/decide' } }), /local endpoint/);
+  },
+});
 module.exports = { tests };

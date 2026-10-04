@@ -226,7 +226,14 @@ export interface RouterRule {
   outputs?: Record<string, unknown>;
 }
 
-export type RouterRoutingMode = 'llm' | 'quick' | 'rules';
+export type RouterRoutingMode = 'llm' | 'quick' | 'rules' | 'arc';
+
+export interface ArcRouterConfig extends Record<string, unknown> {
+  type: 'arc';
+  endpoint: string;
+  package: { alias: string; package_sha256: string };
+  actions: Record<string, { model: string; [key: string]: unknown }>;
+}
 
 export interface RouterCollectionDraft {
   id?: string;
@@ -235,6 +242,7 @@ export interface RouterCollectionDraft {
   candidates: string[];        // routing.candidates - the LLMs that answer requests
   defaultModel: string;        // routing.default_model - must be in candidates
   routingMode: RouterRoutingMode;
+  arcRouter?: ArcRouterConfig;
   // L0(a) fields - used when routingMode === 'llm'
   routerModel?: string;        // routing.router.model - the small classifier LLM (not a candidate)
   routerPrompt?: string;       // routing.router.prompt
@@ -270,7 +278,16 @@ export function validateRouterDraftStructure(draft: RouterCollectionDraft): stri
   if (!draft.candidates.includes(draft.defaultModel)) {
     return 'Default model must be one of the selected candidates.';
   }
-  if (draft.routingMode === 'llm') {
+  if (draft.routingMode === 'arc') {
+    if (!draft.arcRouter) return 'Import an ARC setup file.';
+    const arc = draft.arcRouter;
+    if (!arc.package?.alias || !/^[a-f0-9]{64}$/.test(arc.package?.package_sha256 ?? '')) return 'ARC setup needs a pinned package.';
+    if (!/^http:\/\/(127\.0\.0\.1|localhost|\[::1\]):[0-9]+\/v1\/rayline\/arc\/policy\/decide$/.test(arc.endpoint)) return 'ARC runtime must use a local endpoint.';
+    if (!isRecord(arc.actions) || !Object.keys(arc.actions).length) return 'ARC setup needs model bindings.';
+    for (const [id, action] of Object.entries(arc.actions)) {
+      if (!/^[a-f0-9]{64}$/.test(id) || !isRecord(action) || !draft.candidates.includes(action.model)) return 'Each ARC action must bind to a selected candidate.';
+    }
+  } else if (draft.routingMode === 'llm') {
     if (!draft.routerModel) return 'Select a router LLM.';
     if (!draft.routerPrompt?.trim()) return 'Enter a routing prompt.';
   } else if (draft.routingMode === 'quick') {
@@ -362,7 +379,11 @@ export const buildRouterCollectionPullRequest = (draft: RouterCollectionDraft): 
     default_model: draft.defaultModel,
   };
 
-  if (draft.routingMode === 'llm') {
+  if (draft.routingMode === 'arc') {
+    const error = validateRouterDraftStructure(draft);
+    if (error) throw new Error(error);
+    routing.router = draft.arcRouter;
+  } else if (draft.routingMode === 'llm') {
     if (!draft.routerModel || !draft.routerPrompt?.trim()) {
       throw new Error('LLM router requires a router model and a routing prompt.');
     }
@@ -438,6 +459,10 @@ export const routingToRouterCollectionDraft = (
   // L0(a) - routing.router sugar
   if (routing.router && typeof routing.router === 'object') {
     const r = routing.router as Record<string, unknown>;
+    if (r.type === 'arc') return {
+      id: collectionId, name, candidates, defaultModel, routingMode: 'arc',
+      arcRouter: r as ArcRouterConfig, classifiers: [], rules: [],
+    };
     return {
       id: collectionId, name, candidates, defaultModel,
       routingMode: 'llm',
