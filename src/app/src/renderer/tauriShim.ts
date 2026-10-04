@@ -124,6 +124,7 @@ async function installTauriApi(): Promise<void> {
     },
 
     getSettings: () => invoke('get_app_settings'),
+    getFixedServerUrl: () => invoke<string | null>('get_fixed_server_url'),
     saveSettings: (settings: unknown) => invoke('save_app_settings', { payload: settings }),
     onSettingsUpdated: (callback: (settings: unknown) => void) =>
       on<unknown>(EVT_SETTINGS_UPDATED, callback),

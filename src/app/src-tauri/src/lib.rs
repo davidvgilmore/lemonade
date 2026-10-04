@@ -5,6 +5,7 @@
 pub mod beacon;
 pub mod commands;
 pub mod events;
+mod profile;
 pub mod settings;
 pub mod tray_launcher;
 pub mod webview_shim;
@@ -63,11 +64,25 @@ pub fn run() {
         .try_init()
         .ok();
 
+    let mut profile_guard = match profile::initialize() {
+        Ok(guard) => guard,
+        Err(error) => {
+            eprintln!("Cannot start Lemonade desktop: {error}");
+            std::process::exit(2);
+        }
+    };
+    let isolated = profile::current().is_some();
+    let mut context = tauri::generate_context!();
+    if isolated {
+        for window in &mut context.config_mut().app.windows {
+            window.incognito = true;
+        }
+    }
     let mut builder = tauri::Builder::default();
 
     // Single instance (desktop only).
     #[cfg(desktop)]
-    {
+    if !isolated {
         builder = builder.plugin(tauri_plugin_single_instance::init(|app, args, _cwd| {
             log::info!("Second instance launched with args: {:?}", args);
             if let Some(window) = app.get_webview_window("main") {
@@ -87,30 +102,34 @@ pub fn run() {
         }));
     }
 
+    if !isolated {
+        builder = builder.plugin(tauri_plugin_deep_link::init());
+    }
+
     builder
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_clipboard_manager::init())
-        .plugin(tauri_plugin_deep_link::init())
-        .setup(|app| {
+        .setup(move |app| {
             let app_handle = app.handle().clone();
 
             // Start macOS tray if needed (no-op elsewhere)
             tray_launcher::ensure_tray_running();
 
             // Background beacon listener — async task on Tauri's runtime
-            let listener_handle = app_handle.clone();
-            tauri::async_runtime::spawn(async move {
-                beacon::run_beacon_listener(listener_handle).await;
-            });
+            if !isolated {
+                let listener_handle = app_handle.clone();
+                tauri::async_runtime::spawn(async move {
+                    beacon::run_beacon_listener(listener_handle).await;
+                });
+            }
 
             // Register deep-link handler (macOS open-url, Linux xdg-open, etc.)
             #[cfg(desktop)]
-            {
+            if !isolated {
                 use tauri_plugin_deep_link::DeepLinkExt;
                 let deep_link_handle = app_handle.clone();
                 app.deep_link().on_open_url(move |event| {
-                    let urls: Vec<String> =
-                        event.urls().iter().map(|u| u.to_string()).collect();
+                    let urls: Vec<String> = event.urls().iter().map(|u| u.to_string()).collect();
                     handle_protocol_urls(&deep_link_handle, &urls);
                 });
 
@@ -134,8 +153,7 @@ pub fn run() {
             if let Some(window) = app.get_webview_window("main") {
                 #[cfg(target_os = "windows")]
                 {
-                    let icon =
-                        tauri::image::Image::from_bytes(ELECTRON_WINDOWS_ICON_BYTES)?;
+                    let icon = tauri::image::Image::from_bytes(ELECTRON_WINDOWS_ICON_BYTES)?;
                     window.set_icon(icon)?;
                 }
 
@@ -147,10 +165,8 @@ pub fn run() {
                 window.on_window_event(move |event| {
                     if matches!(event, WindowEvent::Resized(_)) {
                         if let Ok(maximized) = window_clone.is_maximized() {
-                            let prev = last_maximized.swap(
-                                maximized,
-                                std::sync::atomic::Ordering::Relaxed,
-                            );
+                            let prev = last_maximized
+                                .swap(maximized, std::sync::atomic::Ordering::Relaxed);
                             if prev != maximized {
                                 let _ = emitter.emit(events::MAXIMIZE_CHANGE, maximized);
                             }
@@ -169,6 +185,7 @@ pub fn run() {
             commands::zoom_in,
             commands::zoom_out,
             commands::get_app_settings,
+            commands::get_fixed_server_url,
             commands::save_app_settings,
             commands::get_server_base_url,
             commands::get_server_api_key,
@@ -178,8 +195,14 @@ pub fn run() {
             commands::get_local_marketplace_url,
             commands::renderer_ready,
         ])
-        .run(tauri::generate_context!())
-        .expect("error while running tauri application");
+        .build(context)
+        .expect("error while building tauri application")
+        .run(move |_, event| {
+            // Tauri exits the process without unwinding the outer stack.
+            if matches!(event, tauri::RunEvent::Exit) {
+                drop(profile_guard.take());
+            }
+        });
 }
 
 #[cfg(test)]

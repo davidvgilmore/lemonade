@@ -168,3 +168,49 @@ Unit tests live alongside the Rust modules and cover settings sanitization, beac
 ```bash
 cargo test --manifest-path src-tauri/Cargo.toml
 ```
+
+### Isolated desktop sessions
+
+A source-built desktop executable can use a separate client profile while another
+Lemonade desktop session remains open:
+
+```bash
+./src-tauri/target/debug/lemonade-app \
+  --isolated-profile /absolute/path/to/private-desktop-profile \
+  --server-url http://127.0.0.1:18316
+```
+
+Build this executable with `npm run build:nobundle -- --debug` from `src/app`
+first. Start the server separately; this remains a thin client and does not
+start or stop `lemond`.
+
+Both options are required together. The URL must include `http://` or `https://`
+and must not include credentials, a query, or a fragment. It is fixed for the
+life of this process; changing it in Settings is refused with an error. Restart
+with a different `--server-url` to use another server.
+
+Settings live in the selected directory, without reading or migrating the
+normal or legacy settings files. The native WebView uses an ephemeral store, so
+browser-local conversations and storage do not persist between isolated
+launches. The app skips shared single-instance activation, tray startup, server
+beacon discovery, and `lemonade://` registration and handling. Normal launches
+without these options retain their existing behavior. This profile isolates
+client state, not the selected server: use a separately configured server when
+server-side model or router changes also need isolation.
+
+A `desktop.lock` file prevents simultaneous ownership of the same profile. A
+normal app exit removes it. After a forced termination or crash, inspect its
+recorded PID and confirm that process is gone before manually removing the stale
+lock. Startup never kills another client or automatically removes a stale lock.
+Do not use the normal or legacy Lemonade settings directory as the isolated
+profile. Isolated profiles are not a security sandbox for untrusted files.
+
+For a dedicated test or managed build that must never enter the normal client
+profile, add `--features isolated-profile-required` to `tauri build`. Such a
+build refuses startup without both profile options before initializing Tauri,
+plugins, or settings. This also prevents launchers or automation that reopen an
+app without its original arguments from falling back to normal settings. The
+feature is off by default. For an independent macOS test app identity, use
+Tauri's supported `--config` override with a distinct `identifier` and
+`productName`, and `plugins.deep-link.desktop: []` to omit URL handlers from the
+test bundle. Inspect its generated Info.plist before launching it.

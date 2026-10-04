@@ -105,6 +105,11 @@ pub(crate) struct ConnectionSettings {
 }
 
 #[tauri::command]
+pub(crate) fn get_fixed_server_url() -> Option<String> {
+    crate::profile::current().map(|profile| profile.server_url.clone())
+}
+
+#[tauri::command]
 pub(crate) fn get_app_settings() -> AppSettings {
     settings::read_app_settings()
 }
