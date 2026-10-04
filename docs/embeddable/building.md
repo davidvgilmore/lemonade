@@ -46,27 +46,27 @@ The `embeddable` CMake target builds the server, CLI, and required resource file
 
 ## Include the Web App
 
-If you want the embeddable build to include the browser UI assets under `resources/web-app`, enable `BUILD_WEB_APP` and build the `web-app` target before `embeddable`:
+If you want the embeddable build to include the browser UI assets under `resources/web-app`, enable `BUILD_WEB_APP`. The `embeddable` target builds the `web-app` dependency before packaging:
 
 === "Windows (cmd.exe)"
 
     ```cmd
     cmake --preset windows -DBUILD_WEB_APP=ON
-    cmake --build --preset windows --target web-app embeddable
+    cmake --build --preset windows --target embeddable
     ```
 
 === "Linux (bash)"
 
     ```bash
     cmake --preset default -DBUILD_WEB_APP=ON
-    cmake --build --preset default --target web-app embeddable
+    cmake --build --preset default --target embeddable
     ```
 
 === "macOS (bash)"
 
     ```bash
     cmake --preset default -DBUILD_WEB_APP=ON
-    cmake --build --preset default --target web-app embeddable
+    cmake --build --preset default --target embeddable
     ```
 
 ## Expected Outputs
@@ -88,3 +88,9 @@ Each archive contains:
 - `resources/server_models.json`
 - `resources/backend_versions.json`
 - `resources/defaults.json`
+
+The archive includes the staged runtime resources, including architecture defaults,
+benchmark configuration, schemas, and bundled API documentation. With
+`BUILD_WEB_APP=ON`, it also includes the built `resources/web-app` assets. Packaging
+fails if those enabled assets are missing. With `BUILD_WEB_APP=OFF`, an earlier web
+build left in the build directory is excluded from the archive.

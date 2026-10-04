@@ -2230,25 +2230,13 @@ add_custom_target(embeddable
     # Copy LICENSE
     COMMAND ${CMAKE_COMMAND} -E copy "${CMAKE_CURRENT_SOURCE_DIR}/LICENSE" "${EMBEDDABLE_STAGING_DIR}/"
 
-    # Copy resource files
-    COMMAND ${CMAKE_COMMAND} -E copy
-        "$<TARGET_FILE_DIR:lemond>/resources/server_models.json"
-        "${EMBEDDABLE_STAGING_DIR}/resources/"
-    COMMAND ${CMAKE_COMMAND} -E copy
-        "$<TARGET_FILE_DIR:lemond>/resources/backend_versions.json"
-        "${EMBEDDABLE_STAGING_DIR}/resources/"
-    COMMAND ${CMAKE_COMMAND} -E copy
-        "$<TARGET_FILE_DIR:lemond>/resources/vllm_model_config.json"
-        "${EMBEDDABLE_STAGING_DIR}/resources/"
-    COMMAND ${CMAKE_COMMAND} -E copy
-        "$<TARGET_FILE_DIR:lemond>/resources/defaults.json"
-        "${EMBEDDABLE_STAGING_DIR}/resources/"
-    COMMAND ${CMAKE_COMMAND} -E copy
-        "$<TARGET_FILE_DIR:lemond>/resources/bench_scenarios.json"
-        "${EMBEDDABLE_STAGING_DIR}/resources/"
-    COMMAND ${CMAKE_COMMAND} -E copy
-        "$<TARGET_FILE_DIR:lemond>/resources/toolDefinitions.json"
-        "${EMBEDDABLE_STAGING_DIR}/resources/"
+    # Package the same staged resource tree used by the server, rather than a
+    # second hand-maintained list that can omit new runtime configuration.
+    COMMAND ${CMAKE_COMMAND}
+        "-DRESOURCE_SOURCE=${CMAKE_BINARY_DIR}/resources"
+        "-DRESOURCE_DESTINATION=${EMBEDDABLE_STAGING_DIR}/resources"
+        "-DINCLUDE_WEB_APP=${BUILD_WEB_APP}"
+        -P "${CMAKE_CURRENT_SOURCE_DIR}/cmake/StageEmbeddableResources.cmake"
 
     # Create archive
     COMMAND ${CMAKE_COMMAND} -E chdir "${CMAKE_BINARY_DIR}" ${EMBEDDABLE_TAR_CMD}
@@ -2257,6 +2245,18 @@ add_custom_target(embeddable
     COMMENT "Assembling embeddable archive: ${EMBEDDABLE_ARCHIVE_NAME}"
     VERBATIM
 )
+
+if(BUILD_WEB_APP AND TARGET web-app)
+    add_dependencies(embeddable web-app)
+endif()
+
+if(BUILD_TESTING)
+    add_cpp_ci_test(EmbeddableResourcesTest CI OFF
+        COMMAND ${CMAKE_COMMAND}
+            "-DSTAGING_SCRIPT=${CMAKE_CURRENT_SOURCE_DIR}/cmake/StageEmbeddableResources.cmake"
+            "-DTEST_ROOT=${CMAKE_CURRENT_BINARY_DIR}/test-embeddable-resources"
+            -P "${CMAKE_CURRENT_SOURCE_DIR}/test/cmake/test_embeddable_resources.cmake")
+endif()
 
 message(STATUS "Embeddable archive target available: cmake --build . --target embeddable")
 message(STATUS "  Archive: ${EMBEDDABLE_ARCHIVE_NAME}")
