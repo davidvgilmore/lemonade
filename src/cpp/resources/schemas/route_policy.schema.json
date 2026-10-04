@@ -76,8 +76,8 @@
             "properties": {
               "model": { "type": "string", "minLength": 1 },
               "reasoning_effort": { "type": ["string", "null"] },
-              "reasoning_max_tokens": { "type": "null" },
-              "steering_suffix": { "const": "" }
+              "reasoning_max_tokens": { "type": ["integer", "null"], "minimum": 0 },
+              "steering_suffix": { "type": "string" }
             }, "additionalProperties": false
           }
         }

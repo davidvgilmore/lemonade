@@ -44,8 +44,10 @@ inline void validate_arc_router(const json& config) {
             "ARC binding requires model, reasoning_effort, reasoning_max_tokens, steering_suffix");
         arc_require(binding.at("reasoning_effort").is_null() || binding.at("reasoning_effort").is_string(),
             "ARC reasoning_effort must be explicit string or null");
-        arc_require(binding.at("reasoning_max_tokens").is_null() && binding.at("steering_suffix") == "",
-            "ARC reasoning budgets and steering suffixes need an explicit provider mapping; unsupported here");
+        arc_require(binding.at("steering_suffix").is_string(), "ARC steering_suffix must be explicit text");
+        const auto& budget = binding.at("reasoning_max_tokens");
+        arc_require(budget.is_null() || (budget.is_number_integer() && budget.get<int64_t>() >= 0),
+            "ARC reasoning_max_tokens must be null or a nonnegative integer");
     }
 }
 
@@ -60,6 +62,14 @@ inline json arc_request_from_chat(const json& body) {
         if (body.contains(key)) request["request"][key] = body.at(key);
     }
     return request;
+}
+
+inline void validate_arc_chat_bindings(const json& config, const json& request) {
+    for (const auto& action : request.at("selection").at("available_action_ids")) {
+        const auto& binding = config.at("actions").at(action.get<std::string>());
+        arc_require(binding.at("reasoning_max_tokens").is_null() && binding.at("steering_suffix") == "",
+            "ARC chat dispatch does not implement reasoning budgets or stateful steering; use decision-only validation");
+    }
 }
 
 inline Decision route_arc(const json& config, const json& request,

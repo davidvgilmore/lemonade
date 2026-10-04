@@ -94,9 +94,11 @@ result appears in `x_lemonade_route.outputs.arc`. Native controls are not
 inferred from a model name.
 
 The current dispatch adapter supports OpenAI chat and native `reasoning_effort`.
-Nonempty steering suffixes and reasoning budgets are rejected at policy load:
-their provider-specific encoding must be implemented and tested before those
-actions can be dispatched. Conflicting incoming `thinking`, `reasoning`,
+Nonempty steering suffixes and reasoning budgets are accepted as explicit
+catalog metadata for decision-only validation. Chat dispatch rejects requests
+with those eligible actions before calling the worker: their provider-specific
+encoding and stateful steering ledger must be implemented and tested before
+those actions can be dispatched. Conflicting incoming `thinking`, `reasoning`,
 `reasoning_max_tokens`, and `chat_template_kwargs` are rejected. Responses,
 Anthropic, and completions dispatch are not implemented; decision-only
 validation can forward any format accepted by the worker.

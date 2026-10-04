@@ -3693,7 +3693,9 @@ std::optional<RouterDispatchResult> Server::route_collection_request(
     if (collection_info.route_policy->arc_router) {
         try {
             const auto& config = *collection_info.route_policy->arc_router;
-            Decision decision = route_arc(config, arc_request_from_chat(request_json), call_arc_worker);
+            const json arc_request = arc_request_from_chat(request_json);
+            validate_arc_chat_bindings(config, arc_request);
+            Decision decision = route_arc(config, arc_request, call_arc_worker);
             RouterDispatchResult result;
             result.requested_model = collection_info.model_name;
             result.selected_model = decision.route_to;

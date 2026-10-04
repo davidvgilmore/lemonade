@@ -76,7 +76,10 @@ int main() {
     rejects([&] { lemon::validate_arc_router(bad_config); }, "non-loopback destination rejected");
     bad_config = config;
     bad_config["actions"][action]["steering_suffix"] = "unsupported";
-    rejects([&] { lemon::validate_arc_router(bad_config); }, "unsupported steering fails explicitly");
+    lemon::validate_arc_router(bad_config);
+    rejects([&] { lemon::validate_arc_chat_bindings(bad_config, request); }, "unsupported steering fails before chat inference");
+    check(lemon::route_arc(bad_config, request, [&](auto&, auto&) { return response; }).route_to == "candidate",
+          "decision-only validation preserves actions with unsupported dispatch controls");
     dispatch = body;
     dispatch["thinking"] = {{"type", "enabled"}};
     rejects([&] { lemon::apply_arc_dispatch(dispatch, decision); }, "conflicting reasoning controls rejected");

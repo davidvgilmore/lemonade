@@ -192,6 +192,26 @@ class ArcRouterTests(ServerTestBase):
             self.assertEqual(result.status_code, 502, result.text)
             self.assertEqual(receipt, {})
 
+        state["response"] = response
+        policy["routing"]["router"]["actions"][action][
+            "steering_suffix"
+        ] = "synthetic steering"
+        result = requests.post(f"{self.base_url}/pull", json=policy, timeout=10)
+        self.assertEqual(result.status_code, 200, result.text)
+        result = requests.post(
+            f"{self.base_url}/routing/validate",
+            json={"policy": policy, "arc_request": request},
+            timeout=10,
+        )
+        self.assertEqual(result.status_code, 200, result.text)
+        before = len(state["requests"])
+        result = requests.post(
+            f"{self.base_url}/chat/completions", json=body, timeout=10
+        )
+        self.assertEqual(result.status_code, 502, result.text)
+        self.assertEqual(len(state["requests"]), before)
+        self.assertEqual(receipt, {})
+
 
 if __name__ == "__main__":
     run_server_tests(ArcRouterTests, description="ARC CONTRACT TESTS")
