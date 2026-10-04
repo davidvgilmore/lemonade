@@ -29,6 +29,32 @@ static void add_warning(std::vector<std::string>& warnings, const std::string& w
     }
 }
 
+// Chat prompt totals include cache hits and writes; Messages input_tokens do not.
+// A missing cache partition stays unknown instead of becoming a zero count.
+static json anthropic_usage_from_chat(const json& source, std::vector<std::string>& warnings) {
+    json result = json::object();
+    auto count = [](const json& object, const char* key) -> std::optional<int64_t> {
+        if (!object.is_object() || !object.contains(key) || !object[key].is_number_integer()) return std::nullopt;
+        const auto value = object[key].get<int64_t>();
+        return value >= 0 ? std::optional<int64_t>(value) : std::nullopt;
+    };
+    const auto total = count(source, "prompt_tokens");
+    const auto output = count(source, "completion_tokens");
+    const auto details = source.is_object() ? source.value("prompt_tokens_details", json::object()) : json::object();
+    const auto read = count(details, "cached_tokens");
+    const auto write = count(details, "cache_write_tokens");
+    if (output) result["output_tokens"] = *output;
+    if (read) result["cache_read_input_tokens"] = *read;
+    if (write) result["cache_creation_input_tokens"] = *write;
+    if (total && read && write && *read <= *total && *write <= *total - *read) {
+        result["input_tokens"] = *total - *read - *write;
+    } else {
+        add_warning(warnings, "Backend cache breakdown unavailable or inconsistent; uncached input_tokens remains absent");
+    }
+    if (!output) add_warning(warnings, "Backend output token count unavailable; output_tokens remains absent");
+    return result;
+}
+
 static std::string join_strings(const std::vector<std::string>& parts, const char* sep = "\n") {
     std::ostringstream os;
     for (size_t i = 0; i < parts.size(); ++i) {
@@ -556,6 +582,12 @@ json anthropic::convert_anthropic_to_openai_chat(const json& anthropic_request, 
                             ? stringify_anthropic_tool_result_content(block["content"], warnings)
                             : std::string();
 
+                        if (!content_parts.empty()) {
+                            tool_result_messages.push_back({{"role", "user"}, {"content", has_non_text ? content_parts : json(join_strings(text_parts))}});
+                            content_parts = json::array();
+                            text_parts.clear();
+                            has_non_text = false;
+                        }
                         tool_result_messages.push_back({
                             {"role", "tool"},
                             {"tool_call_id", tool_use_id},
@@ -590,6 +622,9 @@ json anthropic::convert_anthropic_to_openai_chat(const json& anthropic_request, 
                 openai_msg["tool_calls"] = assistant_tool_calls;
             }
 
+            for (const auto& tool_msg : tool_result_messages) {
+                messages.push_back(tool_msg);
+            }
             bool has_content = !content_parts.empty();
             bool has_tool_calls = !assistant_tool_calls.empty();
 
@@ -598,9 +633,7 @@ json anthropic::convert_anthropic_to_openai_chat(const json& anthropic_request, 
                 messages.push_back(openai_msg);
             }
 
-            for (const auto& tool_msg : tool_result_messages) {
-                messages.push_back(tool_msg);
-            }
+
         }
     }
 
@@ -809,18 +842,7 @@ json anthropic::convert_openai_chat_to_anthropic(const json& openai_response,
         }
     }
 
-    json usage = json::object();
-    if (openai_response.contains("usage") && openai_response["usage"].is_object()) {
-        const auto& source = openai_response["usage"];
-        for (const auto& field : {std::pair{"prompt_tokens", "input_tokens"}, std::pair{"completion_tokens", "output_tokens"}}) {
-            if (source.contains(field.first) && source[field.first].is_number_integer() && source[field.first].get<int64_t>() >= 0) {
-                usage[field.second] = source[field.first];
-            }
-        }
-    }
-    if (!usage.contains("input_tokens") || !usage.contains("output_tokens")) {
-        add_warning(mutable_warnings, "Backend usage unavailable; missing token counts remain absent");
-    }
+    const json usage = anthropic_usage_from_chat(openai_response.value("usage", json::object()), mutable_warnings);
 
     json anthropic_res = {
         {"id", response_id},
@@ -907,11 +929,7 @@ void anthropic::stream_openai_sse_to_anthropic_sse(const std::string& openai_bod
                     started = true;
                 }
                 if (chunk.contains("usage") && chunk["usage"].is_object()) {
-                    for (const auto& field : {std::pair{"prompt_tokens", "input_tokens"}, std::pair{"completion_tokens", "output_tokens"}}) {
-                        if (chunk["usage"].contains(field.first) && chunk["usage"][field.first].is_number_integer() && chunk["usage"][field.first].get<int64_t>() >= 0) {
-                            usage[field.second] = chunk["usage"][field.first];
-                        }
-                    }
+                    usage.update(chunk["usage"]);
                 }
                 if (!chunk.contains("choices") || !chunk["choices"].is_array() || chunk["choices"].empty()) continue;
                 const auto& choice = chunk["choices"][0];
@@ -970,12 +988,10 @@ void anthropic::stream_openai_sse_to_anthropic_sse(const std::string& openai_bod
             if (!emit("content_block_stop", {{"type", "content_block_stop"}, {"index", entry.second.index}})) { client_sink.done(); return; }
         }
         if (stop_reason == "end_turn" && !tools.empty()) stop_reason = "tool_use";
-        json message_delta = {{"type", "message_delta"}, {"delta", {{"stop_reason", stop_reason}, {"stop_sequence", nullptr}}},
-                              {"usage", usage}};
         auto final_warnings = warnings;
-        if (!usage.contains("input_tokens") || !usage.contains("output_tokens")) {
-            add_warning(final_warnings, "Backend usage unavailable; missing token counts remain absent");
-        }
+        const auto translated_usage = anthropic_usage_from_chat(usage, final_warnings);
+        json message_delta = {{"type", "message_delta"}, {"delta", {{"stop_reason", stop_reason}, {"stop_sequence", nullptr}}},
+                              {"usage", translated_usage}};
         if (!final_warnings.empty()) message_delta["warnings"] = final_warnings;
         if (emit("message_delta", message_delta)) emit("message_stop", {{"type", "message_stop"}});
         client_sink.done();

@@ -33,3 +33,10 @@ reasoning. A routing integration that changes providers must apply its own
 provenance-aware history policy before sending unsigned reasoning to a provider
 that requires signed thinking. Native Anthropic relay continues to preserve the
 original wire representation.
+
+For converted responses, provider cache reads and writes are retained as
+`cache_read_input_tokens` and `cache_creation_input_tokens`. Lemonade derives
+uncached `input_tokens` from the total only when both cache counters are known
+and consistent. Missing counters stay absent with a compatibility warning;
+streaming requests ask the backend for final usage. This does not establish
+that a backend honored the request's cache intent.

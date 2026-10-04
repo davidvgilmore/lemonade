@@ -97,5 +97,21 @@ int main() {
     for (const auto& event : stream({chunk({{"tool_calls", {no_id}}}), chunk(json::object(), "tool_calls")})) {
         check(event["type"] != "message_stop", "missing tool ID became successful turn");
     }
+    // Private steering appended after tool results must remain after them on wire.
+    const auto ordered_request = json::parse(R"({"model":"m","messages":[{"role":"user","content":[{"type":"text","text":"before"},{"type":"tool_result","tool_use_id":"a","content":"first"},{"type":"tool_result","tool_use_id":"b","content":"second"},{"type":"text","text":"private trailing steer"}]}]})");
+    const auto ordered = codec::convert_anthropic_to_openai_chat(ordered_request, warnings)["messages"];
+    check(ordered == json::parse(R"([{"role":"user","content":"before"},{"role":"tool","tool_call_id":"a","content":"first"},{"role":"tool","tool_call_id":"b","content":"second"},{"role":"user","content":"private trailing steer"}])"), "tool results moved after private steering");
+    const json cache_usage = {{"prompt_tokens", 100}, {"completion_tokens", 5}, {"prompt_tokens_details", {{"cached_tokens", 60}, {"cache_write_tokens", 20}}}};
+    const auto cache_response = codec::convert_openai_chat_to_anthropic({{"choices", {{{"message", {{"content", "answer"}}}, {"finish_reason", "stop"}}}}, {"usage", cache_usage}}, "m", {});
+    const json expected_usage = {{"input_tokens", 20}, {"output_tokens", 5}, {"cache_read_input_tokens", 60}, {"cache_creation_input_tokens", 20}};
+    check(cache_response["usage"] == expected_usage, "buffered cache accounting lost or double counted");
+    for (const auto& event : stream({chunk({{"content", "answer"}}), chunk(json::object(), "stop"), {{"choices", json::array()}, {"usage", cache_usage}}})) {
+        if (event["type"] == "message_delta") check(event["usage"] == expected_usage, "stream cache accounting lost or double counted");
+    }
+    auto incomplete_usage = cache_usage;
+    incomplete_usage["prompt_tokens_details"].erase("cache_write_tokens");
+    const auto incomplete = codec::convert_openai_chat_to_anthropic({{"choices", json::array()}, {"usage", incomplete_usage}}, "m", {});
+    check(!incomplete["usage"].contains("input_tokens") && !incomplete["usage"].contains("cache_creation_input_tokens"), "missing cache write became zero");
+    check(incomplete["usage"]["cache_read_input_tokens"] == 60 && incomplete.contains("warnings"), "partial cache evidence discarded");
     std::cout << "Messages thinking/tool history and fragmented streaming verified\n";
 }
