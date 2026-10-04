@@ -482,6 +482,9 @@ static void test_register_preserves_cloud_provider(ModelManager& manager) {
     auto info = manager.get_model_info("user.CloudAlias");
     check("registered cloud alias retains provider and exact upstream identity",
           info.cloud_provider == "custom-cloud" && info.checkpoint() == "vendor/model");
+    manager.evict_cloud_models("custom-cloud");
+    check("provider discovery eviction preserves explicit user aliases",
+          manager.get_model_info("user.CloudAlias").cloud_provider == "custom-cloud");
     ModelManager reloaded;
     auto persisted = reloaded.get_model_info("user.CloudAlias");
     check("cloud provider survives registry reload",

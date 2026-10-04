@@ -4031,9 +4031,11 @@ size_t ModelManager::refresh_cloud_models(const std::string& provider) {
 
     // Reseed: drop this provider's previously-registered entries before
     // inserting the fresh list, so a model the provider stopped exposing
-    // disappears. Other providers' entries are untouched.
+    // disappears. Explicit user aliases are independent of discovery.
+    // Other providers' entries are untouched.
     for (auto it = models_cache_.begin(); it != models_cache_.end();) {
-        if (it->second.recipe == "cloud" && it->second.cloud_provider == provider) {
+        if (it->second.recipe == "cloud" && it->second.cloud_provider == provider &&
+            !is_user_model_name(it->first)) {
             it = models_cache_.erase(it);
         } else {
             ++it;
@@ -4078,7 +4080,8 @@ size_t ModelManager::evict_cloud_models(const std::string& provider) {
     std::lock_guard<std::mutex> lock(models_cache_mutex_);
     size_t removed = 0;
     for (auto it = models_cache_.begin(); it != models_cache_.end();) {
-        if (it->second.recipe == "cloud" && it->second.cloud_provider == provider) {
+        if (it->second.recipe == "cloud" && it->second.cloud_provider == provider &&
+            !is_user_model_name(it->first)) {
             it = models_cache_.erase(it);
             ++removed;
         } else {
