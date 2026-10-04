@@ -70,7 +70,8 @@
           "type": "object", "required": ["endpoint", "owner_id"],
           "properties": {
             "endpoint": { "type": "string", "pattern": "^http://127\\.0\\.0\\.1:[0-9]{1,5}/(experimental/arc/session|v1/rayline/arc/session)$" },
-            "owner_id": { "type": "string", "minLength": 1, "maxLength": 256 }
+            "owner_id": { "type": "string", "minLength": 1, "maxLength": 256 },
+            "codec_sha256": { "type": "string", "pattern": "^[0-9a-f]{64}$" }
           }, "additionalProperties": false
         },
         "package": {

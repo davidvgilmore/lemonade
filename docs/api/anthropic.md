@@ -40,3 +40,11 @@ uncached `input_tokens` from the total only when both cache counters are known
 and consistent. Missing counters stay absent with a compatibility warning;
 streaming requests ask the backend for final usage. This does not establish
 that a backend honored the request's cache intent.
+
+ARC session collections may opt into a pinned return-codec service for prepared
+Chat destinations. That path applies private steering before provider encoding
+and bypasses the compatibility conversions described above. See the
+[ARC session codec contract](../dev/arc-router.md#messages-sessions-with-a-prepared-chat-provider)
+for identity headers, destination binding, cache/reasoning responsibilities and
+terminal settlement. Its transport support does not qualify a particular local
+model or codec's behavior.

@@ -1,4 +1,6 @@
+#include "lemon/arc_chat_frames.h"
 #include "lemon/arc_messages.h"
+#include "lemon/prepared_request.h"
 #include "lemon/anthropic_error.h"
 #include "lemon/anthropic_conversion.h"
 #include "lemon/anthropic_relay_headers.h"
@@ -23,6 +25,82 @@
 namespace lemon {
 
 namespace {
+
+static void forward_arc_chat(Router* router, json routing_request,
+                             const std::shared_ptr<ArcPreparedSession>& prepared,
+                             httplib::Response& res, std::function<bool()> cancelled) {
+    if (!prepared->request().value("stream", false)) {
+        PreparedRequestScope scope(&prepared->request());
+        utils::RequestCancelToken cancellation;
+        cancellation.should_cancel = cancelled;
+        WrappedServer::RequestCancelScope cancel_scope(cancellation);
+        const auto response = router->chat_completion(routing_request);
+        arc_require(!arc_chat_assistant(response).is_null(), "ARC Chat provider did not return terminal success");
+        const auto translated = prepared->transform("response", {{"body", response}}, cancelled).at("body");
+        const auto messages = arc_messages_assistant(translated);
+        arc_require(!messages.is_null(), "ARC codec did not return a terminal Messages response");
+        auto body = std::make_shared<std::string>(translated.dump());
+        res.set_content_provider(body->size(), "application/json",
+            [body](size_t offset, size_t length, httplib::DataSink& sink) {
+                return sink.write(body->data() + offset, length);
+            }, [prepared, messages](bool success) { prepared->finish(success, messages); });
+        return;
+    }
+    prepared->transform("stream_start", json::object(), cancelled);
+    auto native = std::make_shared<ArcMessagesStream>();
+    auto accepted = std::make_shared<bool>(false);
+    res.set_header("Cache-Control", "no-cache");
+    res.set_header("X-Accel-Buffering", "no");
+    res.set_chunked_content_provider("text/event-stream",
+        [router, routing_request, prepared, cancelled, native, accepted](size_t offset, httplib::DataSink& sink) {
+            if (offset > 0) return false;
+            try {
+                ArcChatFrames provider;
+                uint64_t sequence = 0;
+                std::vector<std::string> held;
+                const auto stopped = [&]() {
+                    return (cancelled && cancelled()) || (sink.is_writable && !sink.is_writable());
+                };
+                auto deliver = [&](const json& result, bool terminal) {
+                    for (const auto& item : result.at("frames")) held.push_back(item.get<std::string>());
+                    for (auto it = held.begin(); it != held.end();) {
+                        // A codec may produce its terminal before the provider's [DONE].
+                        // Retain that frame until the provider protocol is complete.
+                        auto probe = *native;
+                        if (!probe.accept(it->data(), it->size())) return false;
+                        if (probe.terminal() && !terminal) break;
+                        if (stopped() || !sink.write(it->data(), it->size())) return false;
+                        *native = std::move(probe);
+                        *accepted = native->terminal() && terminal;
+                        it = held.erase(it);
+                    }
+                    return true;
+                };
+                PreparedRequestScope scope(&prepared->request(), [accepted]() { return *accepted; });
+                httplib::DataSink bridge;
+                bridge.is_writable = [&]() { return !stopped(); };
+                bridge.done = []() {};
+                bridge.done_with_trailer = [](const httplib::Headers&) {};
+                bridge.write = [&](const char* data, size_t size) {
+                    return provider.accept(data, size, [&](const std::string& frame, bool terminal) {
+                        auto result = prepared->transform("stream_push", {{"sequence", sequence++}, {"frame", frame}}, stopped);
+                        if (!deliver(result, terminal)) return false;
+                        if (terminal) {
+                            result = prepared->transform("stream_finish", {{"sequence", sequence++}}, stopped);
+                            if (!deliver(result, true)) return false;
+                            arc_require(*accepted, "ARC codec did not produce a terminal Messages event");
+                        }
+                        return true;
+                    });
+                };
+                router->chat_completion_stream(routing_request.dump(), bridge);
+                if (*accepted) sink.done();
+            } catch (const std::exception&) {
+                // Releaser aborts a failed translation without inventing a terminal.
+            }
+            return *accepted;
+        }, [prepared, native, accepted](bool) { prepared->finish(*accepted, native->messages()); });
+}
 
 static void add_warning(std::vector<std::string>& warnings, const std::string& warning) {
     if (std::find(warnings.begin(), warnings.end(), warning) == warnings.end()) {
@@ -1050,8 +1128,11 @@ void OllamaApi::handle_anthropic_messages(const httplib::Request& req, httplib::
                     for (const auto& action : config.at("actions")) {
                         const auto candidate = model_manager_->get_model_info(action.at("model").get<std::string>());
                         const auto registry = model_manager_->cloud_registry();
-                        if (candidate.recipe == "cloud" && registry &&
-                            registry->wire_format_for(candidate.cloud_provider) == "anthropic") has_native_candidate = true;
+                        if ((candidate.recipe == "cloud" && registry &&
+                             registry->wire_format_for(candidate.cloud_provider) == "anthropic") ||
+                            (!info.route_policy->arc_session->codec_sha256.empty() &&
+                             (candidate.recipe == "llamacpp" || (candidate.recipe == "cloud" && registry &&
+                              registry->wire_format_for(candidate.cloud_provider) == "openai")))) has_native_candidate = true;
                     }
                     arc_require(has_native_candidate, "ARC collection has no native Anthropic Messages candidates");
                     auto prepared = prepare_arc_session(config, *info.route_policy->arc_session,
@@ -1059,6 +1140,20 @@ void OllamaApi::handle_anthropic_messages(const httplib::Request& req, httplib::
                         request_json, "anthropic_messages", req.is_connection_closed);
                     const auto action = prepared->receipt().at("action_id").get<std::string>();
                     const auto selected = config.at("actions").at(action).at("model").get<std::string>();
+                    if (prepared->receipt().at("request_format") == "openai_chat") {
+                        const auto candidate = model_manager_->get_model_info(selected);
+                        const auto registry = model_manager_->cloud_registry();
+                        arc_require((candidate.recipe == "llamacpp" && prepared->request().at("model") == selected) || (candidate.recipe == "cloud" && registry &&
+                            registry->wire_format_for(candidate.cloud_provider) == "openai" &&
+                            candidate.checkpoint() == prepared->request().at("model")),
+                            "ARC prepared Chat requires a matching registered Chat provider or llama.cpp model");
+                        auto_load_model(selected, extract_auto_load_options(prepared->request()));
+                        json routing_request = prepared->request();
+                        routing_request["model"] = selected;
+                        res.set_header("x-lemonade-route", "arc_session");
+                        forward_arc_chat(router_, std::move(routing_request), prepared, res, req.is_connection_closed);
+                        return;
+                    }
                     auto match = resolve_anthropic_upstream(model_manager_, selected, prepared->request(), req, true);
                     arc_require(match.claimed, "ARC native Messages requires a registered Anthropic-format provider");
                     if (!match.upstream) {

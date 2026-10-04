@@ -1,3 +1,4 @@
+#include "lemon/arc_chat_frames.h"
 #include "lemon/arc_session.h"
 #include "lemon/arc_messages.h"
 
@@ -11,6 +12,15 @@ static void require(bool condition) {
 }
 
 int main() {
+    ArcChatFrames frames;
+    const std::string complete = "data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n";
+    size_t count = 0;
+    const auto emit = [&](const std::string&, bool) { ++count; return true; };
+    for (const char byte : complete) require(frames.accept(&byte, 1, emit));
+    require(count == 1 && !frames.terminal());
+    require(frames.accept("\n", 1, emit) && frames.terminal() && count == 2);
+    require(parse_arc_session({{"endpoint", "http://127.0.0.1:9/experimental/arc/session"},
+                              {"owner_id", "host"}, {"codec_sha256", std::string(64, 'e')}}).codec_sha256.size() == 64);
     ArcChatStream stream;
     const std::string events =
         "data: {\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\",\"tool_calls\":[{\"index\":0,\"id\":\"call-1\",\"type\":\"function\",\"function\":{\"name\":\"read\",\"arguments\":\"{\\\"path\\\":\"}}]},\"finish_reason\":null}]}\n\n"

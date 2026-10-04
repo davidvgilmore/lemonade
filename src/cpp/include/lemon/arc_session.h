@@ -15,10 +15,11 @@
 namespace lemon {
 
 inline ArcSessionConfig parse_arc_session(const json& value) {
-    arc_require(value.is_object() && value.size() == 2,
+    arc_require(value.is_object() && (value.size() == 2 || (value.size() == 3 && value.contains("codec_sha256"))),
                 "ARC session requires endpoint and owner_id");
     ArcSessionConfig config{value.at("endpoint").get<std::string>(),
-                            value.at("owner_id").get<std::string>()};
+                            value.at("owner_id").get<std::string>(), value.value("codec_sha256", std::string())};
+    arc_require(config.codec_sha256.empty() || arc_sha256(config.codec_sha256), "ARC codec pin must be a SHA-256 digest");
     arc_require(std::regex_match(config.endpoint,
         std::regex("http://127\\.0\\.0\\.1:[0-9]{1,5}/(experimental/arc/session|v1/rayline/arc/session)")),
         "ARC session endpoint must be numeric loopback");
@@ -86,6 +87,7 @@ public:
     ~ArcPreparedSession() { finish(false); }
     const json& request() const { return receipt_.at("request"); }
     const json& receipt() const { return receipt_; }
+    json transform(const std::string& operation, json payload, std::function<bool()> cancelled = {}) const;
 
     void finish(bool success, const json& messages = nullptr) noexcept {
         if (settled_.exchange(true)) return;
@@ -141,9 +143,15 @@ inline void validate_arc_session_receipt(const json& config, const ArcSessionCon
     arc_require(receipt.at("owner_id") == session.owner_id &&
                 receipt.at("package_sha256") == config.at("package").at("package_sha256"),
                 "ARC session owner/package mismatch");
-    arc_require(receipt.at("request_format") == format &&
-                receipt.at("source_request_format") == format,
-                "ARC session wire format does not match native ingress");
+    arc_require(receipt.at("source_request_format") == format, "ARC session source format mismatch");
+    if (receipt.at("request_format") != format) {
+        arc_require(format == "anthropic_messages" && receipt.at("request_format") == "openai_chat" &&
+                    !session.codec_sha256.empty(), "ARC cross-format dispatch requires an opted-in pinned codec");
+        const auto& codec = receipt.at("response_codec");
+        arc_require(codec == json({{"schema_version", "rayline.arc.response-codec.v1"},
+            {"source", "openai_chat"}, {"target", "anthropic_messages"},
+            {"implementation_sha256", session.codec_sha256}}), "ARC response codec binding mismatch");
+    }
     const auto action = receipt.at("action_id").get<std::string>();
     arc_require(config.at("actions").contains(action), "ARC session selected unbound action");
     const auto& decision = receipt.at("decision");

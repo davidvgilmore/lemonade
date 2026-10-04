@@ -259,7 +259,8 @@ native transport, Lemonade aborts that receipt and refuses dispatch. It does not
 substitute a different winner or narrow the ARC basket to suit a protocol.
 The service must retain the pinned full trained Stage-1 basket and refuse an
 unavailable winner rather than renormalizing or retraining the basket. Local
-Qwen and cross-format provider routing remain unqualified on this path.
+Qwen requires the separately opted-in cross-format contract below; this native
+relay does not perform a conversion.
 
 The service receives the original Messages body with
 `request_format: anthropic_messages` and must return that same native format.
@@ -286,3 +287,60 @@ wire equality, signed/redacted/tool block history, cache intent and reported usa
 unknown delta disposition, terminal-without-EOF, continuation, failure and drop.
 It runs alongside the Chat fixture in the existing router CI stages. Neither
 fixture establishes numerical ARC parity or qualification of a real provider.
+
+### Messages sessions with a prepared Chat provider
+
+A session configuration may additionally set `codec_sha256` to the SHA-256
+identity of its qualified request/return codec implementation. With that opt-in,
+Messages ingress can accept a prepared `openai_chat` request. The service receipt
+must retain `source_request_format: anthropic_messages` and contain exactly:
+
+```json
+{
+  "response_codec": {
+    "schema_version": "rayline.arc.response-codec.v1",
+    "source": "openai_chat",
+    "target": "anthropic_messages",
+    "implementation_sha256": "<configured codec SHA-256>"
+  }
+}
+```
+
+Preparation still receives the entire configured action basket. The service
+applies private history and native controls before encoding the provider request.
+It must refuse an unsupported selected winner, without selecting another action.
+Lemonade validates the prepared model against the selected cloud registration's
+checkpoint. For a local llama.cpp destination, the prepared model and action's
+`wire_model` must equal the selected registered Lemonade alias. Other backend
+recipes and wire formats are refused. The host loads that destination and uses
+its existing credentials, HTTP security policy, cancellation and transport.
+The prepared body is sent unchanged; the compatibility converter is bypassed.
+
+The host posts return conversions to the same session endpoint's `/codec` route.
+Every call includes `owner_id`, `session_token`, `implementation_sha256` and
+`operation`. The service must bind them to a pending preparation and return the
+same `implementation_sha256`. Buffered `response` calls carry the actual provider
+`body` and return a Messages `body`. Streaming uses `stream_start`, followed by
+`stream_push` calls with one complete SSE `frame` and zero-based, monotonically
+increasing `sequence`, then `stream_finish` with the next sequence. Push and
+finish replies contain `frames`, an array of complete native SSE strings. Streams
+and requests are bounded to 16 MiB; codec calls have a 10-second timeout and client
+cancellation. Commit or abort must dispose of the service's codec stream state.
+
+The host observes both protocols. It withholds a translated terminal until the
+provider has supplied a finish reason and a complete `[DONE]` frame. It commits
+only after the translated `message_stop` is accepted by the client transport,
+using the exact delivered Messages assistant blocks for subsequent attribution.
+An upstream HTTP connection left open after its terminal does not delay commit.
+A rejected or failed codec, incomplete provider response or earlier client drop
+aborts; a missing settlement acknowledgment quarantines the session as above.
+The service owns signed/encrypted reasoning disposition and cache translation;
+a codec must explicitly refuse unsupported or lossy cells instead of inventing
+usage, signatures or private instructions.
+
+`test/server_arc_codec.py` exercises this contract through a real isolated server
+and a synthetic codec/provider. It runs in the router CI stages. This public
+transport test does not establish any private codec's correctness, numerical ARC
+parity, real Qwen inference, or the local llama.cpp subprocess seam. Those require
+separate composition evidence against the selected package, codec and runtime.
+Responses ingress remains unsupported by session collections.

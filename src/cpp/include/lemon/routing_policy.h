@@ -453,6 +453,7 @@ NamedLeafFactories make_deterministic_leaf_factories();
 struct ArcSessionConfig {
     std::string endpoint;
     std::string owner_id;
+    std::string codec_sha256;
 };
 
 struct RoutePolicy {
