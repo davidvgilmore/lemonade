@@ -118,7 +118,7 @@ static const std::vector<std::string> USER_DEFINED_MODEL_PROPS = std::vector<std
     "checkpoints", "checkpoint", "recipe", "mmproj", "size",
     "image_defaults", "audio_defaults", "components", "recipe_options",
     "routing", "system_prompt", "version", "source", "registry_source",
-    "auto_update"
+    "auto_update", "cloud_provider"
 };
 
 static std::string visible_extra_variant_name(const lemon::GgufVariant& variant) {

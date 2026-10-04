@@ -475,6 +475,19 @@ static void test_register_preserves_routing(ModelManager& manager) {
           it != info.extras.end() && it->second == doc["routing"]);
 }
 
+static void test_register_preserves_cloud_provider(ModelManager& manager) {
+    json doc = {{"recipe", "cloud"}, {"checkpoint", "vendor/model"},
+                {"cloud_provider", "custom-cloud"}, {"labels", {"chat"}}};
+    manager.register_user_model("user.CloudAlias", doc);
+    auto info = manager.get_model_info("user.CloudAlias");
+    check("registered cloud alias retains provider and exact upstream identity",
+          info.cloud_provider == "custom-cloud" && info.checkpoint() == "vendor/model");
+    ModelManager reloaded;
+    auto persisted = reloaded.get_model_info("user.CloudAlias");
+    check("cloud provider survives registry reload",
+          persisted.cloud_provider == "custom-cloud");
+}
+
 int main() {
     fs::path temp = make_temp_dir();
     lemon::utils::set_cache_dir(temp.string());
@@ -488,6 +501,7 @@ int main() {
     test_filtered_classifier_bare_name_resolves_through_alias(manager);
     test_filtered_classifier_builtin_prefixed_alias_resolves(manager);
     test_register_preserves_routing(manager);
+    test_register_preserves_cloud_provider(manager);
 
     fs::remove_all(temp);
 
