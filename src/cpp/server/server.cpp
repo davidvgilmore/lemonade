@@ -99,22 +99,6 @@ static json call_arc_worker(const std::string& endpoint, const json& request) {
     return json::parse(response.body);
 }
 
-static json settle_arc_session(const std::string& endpoint, const json& request) {
-    try {
-        auto response = utils::HttpClient::post(endpoint, request.dump(),
-            {{"Content-Type", "application/json"}}, 10,
-            utils::HttpSecurityPolicy::TrustedLoopback);
-        arc_require(response.status_code == 200, "ARC session settlement failed");
-        auto result = json::parse(response.body);
-        const bool commit = endpoint.size() >= 7 && endpoint.compare(endpoint.size() - 7, 7, "/commit") == 0;
-        arc_require(result.value("state", "") == (commit ? "committed" : "aborted"),
-                    "ARC session settlement was not acknowledged");
-        return result;
-    } catch (...) {
-        LOG(ERROR, "ARC") << "Session settlement acknowledgment unavailable; outcome unknown" << std::endl;
-        throw;
-    }
-}
 
 namespace {
 
@@ -3739,12 +3723,9 @@ std::optional<RouterDispatchResult> Server::route_collection_request(
                 const auto& session = *collection_info.route_policy->arc_session;
                 ArcSessionIdentity identity{request->get_header_value("X-Client-Session-Id"),
                                             request->get_header_value("X-Lemonade-Request-Id")};
-                const auto payload = arc_session_prepare_payload(config, session, identity, json::parse(request->body));
-                const auto gate_key = json::array({session.endpoint, session.owner_id, identity.session_id}).dump();
-                auto lease = std::make_shared<ArcSessionLease>(gate_key, request->is_connection_closed);
-                const auto receipt = call_arc_worker(session.endpoint + "/prepare", payload);
-                auto prepared = std::make_shared<ArcPreparedSession>(session, receipt, settle_arc_session, std::move(lease));
-                validate_arc_session_receipt(config, session, receipt, request_json);
+                auto prepared = prepare_arc_session(config, session, identity,
+                    json::parse(request->body), "openai_chat", request->is_connection_closed);
+                const auto& receipt = prepared->receipt();
                 const auto action = receipt.at("action_id").get<std::string>();
                 const auto selected = config.at("actions").at(action).at("model").get<std::string>();
                 const auto target = model_manager_->get_model_info(selected);

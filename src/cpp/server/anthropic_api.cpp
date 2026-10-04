@@ -1,3 +1,4 @@
+#include "lemon/arc_messages.h"
 #include "lemon/anthropic_error.h"
 #include "lemon/anthropic_conversion.h"
 #include "lemon/anthropic_relay_headers.h"
@@ -249,7 +250,8 @@ using anthropic::is_forwardable_response_header;
 static AnthropicUpstreamMatch resolve_anthropic_upstream(ModelManager* model_manager,
                                                          const std::string& model,
                                                          const json& request_json,
-                                                         const httplib::Request& req) {
+                                                         const httplib::Request& req,
+                                                         bool prepared = false) {
     AnthropicUpstreamMatch match;
     if (model_manager == nullptr) return match;
     CloudProviderRegistry* registry = model_manager->cloud_registry();
@@ -302,7 +304,9 @@ static AnthropicUpstreamMatch resolve_anthropic_upstream(ModelManager* model_man
     // The body passes through byte-for-byte apart from "model", which must name
     // the provider's own id rather than lemonade's "<provider>.<id>" public one.
     json forwarded = request_json;
-    forwarded["model"] = info.checkpoint();
+    if (prepared) {
+        if (forwarded.at("model") != info.checkpoint()) return fail(502, "ARC prepared model does not match registered Anthropic upstream");
+    } else forwarded["model"] = info.checkpoint();
 
     const auto auth_header = registry->auth_header_for(info.cloud_provider);
     AnthropicUpstream upstream;
@@ -348,14 +352,28 @@ static void relay_response_headers(const std::map<std::string, std::string>& ups
 static void forward_anthropic_upstream(AnthropicUpstream upstream,
                                        bool stream,
                                        const std::string& model,
-                                       httplib::Response& res) {
+                                       httplib::Response& res,
+                                       std::shared_ptr<ArcPreparedSession> prepared = nullptr,
+                                       std::function<bool()> cancelled = {}) {
     if (!stream) {
         try {
+            utils::RequestCancelToken cancellation;
+            cancellation.should_cancel = cancelled;
             auto response = utils::HttpClient::post(
-                upstream.url, upstream.body, upstream.headers, 0, upstream.policy);
+                upstream.url, upstream.body, upstream.headers, 0, upstream.policy, cancellation);
             res.status = response.status_code;
             relay_response_headers(response.headers, res);
-            res.set_content(response.body, "application/json");
+            if (prepared) {
+                const auto parsed = json::parse(response.body, nullptr, false);
+                const auto assistant = parsed.is_discarded() ? json(nullptr) : arc_messages_assistant(parsed);
+                const bool terminal = response.status_code == 200 && !assistant.is_null();
+                auto body = std::make_shared<std::string>(std::move(response.body));
+                res.set_content_provider(body->size(), "application/json",
+                    [body](size_t offset, size_t length, httplib::DataSink& sink) {
+                        return sink.write(body->data() + offset, length);
+                    },
+                    [prepared, assistant, terminal](bool success) { prepared->finish(success && terminal, assistant); });
+            } else res.set_content(response.body, "application/json");
         } catch (const std::exception& e) {
             set_anthropic_error_response(
                 res, 502, "cloud request for '" + model + "' failed: " + e.what());
@@ -371,9 +389,11 @@ static void forward_anthropic_upstream(AnthropicUpstream upstream,
     // as an SSE error frame instead) but keeps every blocking wait somewhere
     // sink.is_writable can observe the peer, so a client that disappears cannot
     // strand the upstream transfer.
+    auto observed = std::make_shared<ArcMessagesStream>();
+    auto accepted_terminal = std::make_shared<bool>(false);
     res.set_chunked_content_provider(
         "text/event-stream",
-        [upstream = std::move(upstream), model](size_t offset, httplib::DataSink& sink) {
+        [upstream = std::move(upstream), model, prepared, observed, accepted_terminal, cancelled](size_t offset, httplib::DataSink& sink) {
             if (offset > 0) return false;
             // Both ends speak Anthropic SSE, so a 200 relays unparsed. A
             // non-200 body is not SSE, so it is diverted and re-emitted as an
@@ -400,12 +420,15 @@ static void forward_anthropic_upstream(AnthropicUpstream upstream,
                             }
                             return true;
                         }
-                        return sink.write(data, length);
+                        if (prepared && !observed->accept(data, length)) return false;
+                        const bool written = sink.write(data, length);
+                        *accepted_terminal = *accepted_terminal || (written && prepared && observed->terminal());
+                        return written && !*accepted_terminal;
                     },
                     upstream.headers, 0,
                     [&upstream_status](int status) { upstream_status = status; },
                     upstream.policy,
-                    [&sink]() { return sink.is_writable && !sink.is_writable(); },
+                    [&sink, cancelled]() { return (cancelled && cancelled()) || (sink.is_writable && !sink.is_writable()); },
                     &response_headers);
                 // on_status never fires when the body is empty, so fall back to
                 // the code curl always records after the transfer.
@@ -414,14 +437,17 @@ static void forward_anthropic_upstream(AnthropicUpstream upstream,
                 if (status != 200) {
                     emit_error(status, "failed with status " + std::to_string(status) +
                                        (error_body.empty() ? "" : ": " + error_body));
-                } else if (result.curl_code != 0 && sink.is_writable && sink.is_writable()) {
+                } else if (result.curl_code != 0 && !*accepted_terminal && sink.is_writable && sink.is_writable()) {
                     emit_error(502, "stream ended early: " + result.curl_error);
                 }
             } catch (const std::exception& e) {
                 emit_error(502, std::string("failed: ") + e.what());
             }
             sink.done();
-            return false;
+            return prepared ? *accepted_terminal : false;
+        },
+        [prepared, observed, accepted_terminal](bool) {
+            if (prepared) prepared->finish(*accepted_terminal, observed->messages());
         }
     );
 }
@@ -1011,6 +1037,42 @@ void OllamaApi::handle_anthropic_messages(const httplib::Request& req, httplib::
             res.status = 400;
             res.set_content(R"({"type":"error","error":{"type":"invalid_request_error","message":"model is required"}})", "application/json");
             return;
+        }
+
+        if (model_manager_->model_exists(model)) {
+            const auto info = model_manager_->get_model_info(model);
+            if (info.route_policy && info.route_policy->arc_router) {
+                try {
+                    arc_require(info.route_policy->arc_session.has_value(),
+                                "Native Messages requires ARC session configuration");
+                    const auto& config = *info.route_policy->arc_router;
+                    bool has_native_candidate = false;
+                    for (const auto& action : config.at("actions")) {
+                        const auto candidate = model_manager_->get_model_info(action.at("model").get<std::string>());
+                        const auto registry = model_manager_->cloud_registry();
+                        if (candidate.recipe == "cloud" && registry &&
+                            registry->wire_format_for(candidate.cloud_provider) == "anthropic") has_native_candidate = true;
+                    }
+                    arc_require(has_native_candidate, "ARC collection has no native Anthropic Messages candidates");
+                    auto prepared = prepare_arc_session(config, *info.route_policy->arc_session,
+                        {req.get_header_value("X-Client-Session-Id"), req.get_header_value("X-Lemonade-Request-Id")},
+                        request_json, "anthropic_messages", req.is_connection_closed);
+                    const auto action = prepared->receipt().at("action_id").get<std::string>();
+                    const auto selected = config.at("actions").at(action).at("model").get<std::string>();
+                    auto match = resolve_anthropic_upstream(model_manager_, selected, prepared->request(), req, true);
+                    arc_require(match.claimed, "ARC native Messages requires a registered Anthropic-format provider");
+                    if (!match.upstream) {
+                        set_anthropic_error_response(res, match.error_status, match.error_message);
+                        return;
+                    }
+                    res.set_header("x-lemonade-route", "arc_session");
+                    forward_anthropic_upstream(std::move(*match.upstream), request_json.value("stream", false),
+                        selected, res, prepared, req.is_connection_closed);
+                } catch (const std::exception& e) {
+                    set_anthropic_error_response(res, 502, e.what());
+                }
+                return;
+            }
         }
 
         if (req.has_param("beta")) {

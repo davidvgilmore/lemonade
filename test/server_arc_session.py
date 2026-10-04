@@ -290,8 +290,11 @@ class ArcSessionTests(ServerTestBase):
         self.assertEqual(missing.status_code, 502)
         self.assertEqual(state["prepared"], [])
         for endpoint in ("messages", "responses", "completions"):
+            url = f"{self.base_url}/{endpoint}"
+            if endpoint == "messages":
+                url = f"{self.base_url.removesuffix('/api/v1')}/v1/messages"
             unsupported = requests.post(
-                f"{self.base_url}/{endpoint}",
+                url,
                 json={**original, "max_tokens": 17},
                 headers={
                     "X-Client-Session-Id": "conversation",

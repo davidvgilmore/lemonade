@@ -117,10 +117,12 @@ private:
 };
 
 inline json arc_session_prepare_payload(const json& config, const ArcSessionConfig& session,
-                                        const ArcSessionIdentity& identity, const json& request) {
+                                        const ArcSessionIdentity& identity, const json& request,
+                                        const std::string& format = "openai_chat") {
     arc_require(!identity.session_id.empty() && identity.session_id.size() <= 256 &&
                 !identity.operation_id.empty() && identity.operation_id.size() <= 256,
                 "ARC sessions require X-Client-Session-Id and X-Lemonade-Request-Id");
+    arc_require(format == "openai_chat" || format == "anthropic_messages", "Unsupported ARC native request format");
     arc_require(!request.contains("arc_context"), "ARC session mode does not accept replay arc_context");
     arc_require(request.contains("messages") && request.at("messages").is_array(),
                 "ARC session requires materialized Chat history");
@@ -129,18 +131,19 @@ inline json arc_session_prepare_payload(const json& config, const ArcSessionConf
     for (const auto& item : config.at("actions").items()) actions.push_back(item.key());
     return {{"owner_id", session.owner_id}, {"operation_id", identity.operation_id},
             {"metadata", {{"session_id", identity.session_id}}},
-            {"request_format", "openai_chat"}, {"request", request},
+            {"request_format", format}, {"request", request},
             {"available_action_ids", actions}};
 }
 
 inline void validate_arc_session_receipt(const json& config, const ArcSessionConfig& session,
-                                         const json& receipt, const json& source) {
+                                         const json& receipt, const json& source,
+                                         const std::string& format = "openai_chat") {
     arc_require(receipt.at("owner_id") == session.owner_id &&
                 receipt.at("package_sha256") == config.at("package").at("package_sha256"),
                 "ARC session owner/package mismatch");
-    arc_require(receipt.at("request_format") == "openai_chat" &&
-                receipt.at("source_request_format") == "openai_chat",
-                "ARC session wire format is not native Chat");
+    arc_require(receipt.at("request_format") == format &&
+                receipt.at("source_request_format") == format,
+                "ARC session wire format does not match native ingress");
     const auto action = receipt.at("action_id").get<std::string>();
     arc_require(config.at("actions").contains(action), "ARC session selected unbound action");
     const auto& decision = receipt.at("decision");
@@ -164,6 +167,10 @@ inline void validate_arc_session_receipt(const json& config, const ArcSessionCon
                 request.value("n", 1) == 1 && !request.contains("arc_context"),
                 "ARC prepared request destination or response mode mismatch");
 }
+
+std::shared_ptr<ArcPreparedSession> prepare_arc_session(
+    const json& config, const ArcSessionConfig& session, const ArcSessionIdentity& identity,
+    const json& request, const std::string& format, std::function<bool()> cancelled = {});
 
 inline json arc_chat_assistant(const json& response) {
     if (response.contains("error") || !response.contains("choices") ||

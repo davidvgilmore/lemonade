@@ -233,9 +233,8 @@ do not change session identity to bypass an unresolved receipt.
 A session service must make repeated settlement idempotent and reject reuse of
 an operation identity with a different source request.
 
-Native Messages, Responses and completions are separate protocol paths and are
-not qualified by this Chat adapter. Session collections fail closed on those
-paths. Local llama.cpp prepared transport is implemented but numerical ARC
+Responses and completions remain separate, unsupported protocol paths.
+Session collections fail closed on those paths. Local llama.cpp prepared transport is implemented but numerical ARC
 encoder/head parity and real local-model composition remain separate checks.
 
 Run `LEMONADE_TEST_PORT=<isolated port> python test/server_arc_session.py` against
@@ -249,3 +248,41 @@ calls.
 `ArcSessionTest` is part of `cpp-ci` and checks fragmented tool history, opaque
 history disposition and settlement ownership. These transport checks do not
 qualify an ARC checkpoint or the session service's own policy/ledger math.
+
+### Native Messages sessions
+
+The same session collection and identity headers work with `/v1/messages` when
+it has registered cloud candidates whose provider `wire_format` is `anthropic`.
+Lemonade passes the full configured action list to the service. A collection
+with no native candidate fails before preparation; if the selected winner lacks
+native transport, Lemonade aborts that receipt and refuses dispatch. It does not
+substitute a different winner or narrow the ARC basket to suit a protocol.
+The service must retain the pinned full trained Stage-1 basket and refuse an
+unavailable winner rather than renormalizing or retraining the basket. Local
+Qwen and cross-format provider routing remain unqualified on this path.
+
+The service receives the original Messages body with
+`request_format: anthropic_messages` and must return that same native format.
+Preparation happens before the existing Anthropic relay. The prepared model
+must match the selected provider's registered checkpoint. The relay preserves
+prepared system blocks, tool results, private append placement, thinking controls,
+cache-control fields, Anthropic version/beta headers, and existing authentication.
+Buffered responses retain native content blocks and provider usage unchanged.
+Streamed text, thinking, signature and tool-input deltas reconstruct assistant
+history; redacted thinking and untouched block fields remain opaque and exact.
+Unknown deltas are forwarded but produce explicitly unknown attribution.
+
+Native streaming requires a real stop reason and `message_stop`, with every
+started content block stopped. It settles after that terminal event is accepted,
+even if the provider leaves HTTP open or the client closes immediately afterward.
+Partial streams, provider errors and earlier disconnects abort. The same
+per-session acknowledgment ordering and unresolved-session quarantine apply.
+These are host transport properties; cross-model signature disposition and
+private ledger behavior remain the session service's responsibility.
+
+Run `LEMONADE_TEST_PORT=<isolated port> python test/server_arc_messages.py` against
+a freshly built isolated server. Its synthetic provider checks native request
+wire equality, signed/redacted/tool block history, cache intent and reported usage,
+unknown delta disposition, terminal-without-EOF, continuation, failure and drop.
+It runs alongside the Chat fixture in the existing router CI stages. Neither
+fixture establishes numerical ARC parity or qualification of a real provider.
