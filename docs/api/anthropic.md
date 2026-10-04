@@ -17,3 +17,19 @@ Anthropic's adaptive token budgeting and returns a compatibility warning.
 `disabled` sets `enable_thinking: false` and `reasoning_effort: none`.
 These controls require a backend and model template that support them.
 Native Anthropic cloud relay retains the original controls unchanged.
+
+When converting Messages history to an OpenAI-compatible local backend,
+Lemonade keeps plain `thinking` text in `reasoning_content`. Anthropic signatures
+have no destination in that field and are removed with a warning. Opaque
+`redacted_thinking` cannot be translated and produces an explicit 400 response;
+Lemonade does not fabricate readable reasoning from an encrypted block.
+
+Local `reasoning_content` (or the `reasoning` string alias) becomes unsigned
+Messages `thinking` content, including during streaming. Tool IDs, names and
+argument fragments remain separate from text and thinking. A provider error or
+incomplete stream ends with an error event rather than a successful
+`message_stop`. These conversions do not assign a provider signature to local
+reasoning. A routing integration that changes providers must apply its own
+provenance-aware history policy before sending unsigned reasoning to a provider
+that requires signed thinking. Native Anthropic relay continues to preserve the
+original wire representation.

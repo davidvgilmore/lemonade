@@ -3342,6 +3342,12 @@ if(BUILD_TESTING AND EXISTS "${_CLOUD_PROVIDER_REGISTRY_CONFIG_TEST_SRC}")
     add_cpp_ci_test(CloudProviderRegistryConfigTest CI ON COMMAND test_cloud_provider_registry_config)
 endif()
 
+if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test/cpp/test_anthropic_conversion.cpp")
+    add_executable(test_anthropic_conversion test/cpp/test_anthropic_conversion.cpp)
+    target_link_libraries(test_anthropic_conversion PRIVATE lemonade-server-core)
+    add_cpp_ci_test(AnthropicConversionTest CI ON COMMAND test_anthropic_conversion)
+endif()
+
 if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test/cpp/test_anthropic_thinking.cpp")
     add_executable(test_anthropic_thinking test/cpp/test_anthropic_thinking.cpp)
     target_link_libraries(test_anthropic_thinking PRIVATE lemonade-server-core)

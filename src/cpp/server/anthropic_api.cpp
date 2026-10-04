@@ -1,4 +1,5 @@
 #include "lemon/anthropic_error.h"
+#include "lemon/anthropic_conversion.h"
 #include "lemon/anthropic_relay_headers.h"
 #include "lemon/backends/cloud/cloud_server.h"
 #include "lemon/cloud_provider_registry.h"
@@ -407,10 +408,14 @@ void OllamaApi::register_anthropic_routes(httplib::Server& server, const std::sh
     });
 }
 
-json OllamaApi::convert_anthropic_to_openai_chat(const json& anthropic_request, std::vector<std::string>& warnings) {
+json anthropic::convert_anthropic_to_openai_chat(const json& anthropic_request, std::vector<std::string>& warnings) {
     json openai_req;
 
-    std::string model = normalize_model_name(anthropic_request.value("model", ""));
+    std::string model = anthropic_request.value("model", "");
+    const std::string suffix = ":latest";
+    if (model.size() > suffix.size() && model.compare(model.size() - suffix.size(), suffix.size(), suffix) == 0) {
+        model.resize(model.size() - suffix.size());
+    }
     openai_req["model"] = model;
 
     json messages = json::array();
@@ -450,6 +455,7 @@ json OllamaApi::convert_anthropic_to_openai_chat(const json& anthropic_request, 
 
             json content_parts = json::array();
             std::vector<std::string> text_parts;
+            std::string reasoning_text;
             bool has_non_text = false;
             json assistant_tool_calls = json::array();
             std::vector<json> tool_result_messages;
@@ -467,6 +473,18 @@ json OllamaApi::convert_anthropic_to_openai_chat(const json& anthropic_request, 
                         content_parts.push_back({{"type", "text"}, {"text", text}});
                         text_parts.push_back(text);
                         continue;
+                    }
+
+                    if (type == "thinking" && role == "assistant" &&
+                        block.contains("thinking") && block["thinking"].is_string()) {
+                        reasoning_text += block["thinking"].get<std::string>();
+                        if (block.contains("signature")) {
+                            add_warning(warnings, "Removed thinking signature for OpenAI-compatible backend; reasoning text retained");
+                        }
+                        continue;
+                    }
+                    if (type == "redacted_thinking") {
+                        throw std::invalid_argument("Cannot translate opaque redacted_thinking to an OpenAI-compatible backend");
                     }
 
                     if (type == "image" && block.contains("source") && block["source"].is_object()) {
@@ -565,6 +583,9 @@ json OllamaApi::convert_anthropic_to_openai_chat(const json& anthropic_request, 
                 openai_msg["content"] = "";
             }
 
+            if (!reasoning_text.empty()) {
+                openai_msg["reasoning_content"] = reasoning_text;
+            }
             if (!assistant_tool_calls.empty()) {
                 openai_msg["tool_calls"] = assistant_tool_calls;
             }
@@ -697,11 +718,12 @@ json OllamaApi::convert_anthropic_to_openai_chat(const json& anthropic_request, 
     return openai_req;
 }
 
-json OllamaApi::convert_openai_chat_to_anthropic(const json& openai_response,
+json anthropic::convert_openai_chat_to_anthropic(const json& openai_response,
                                                  const std::string& model,
                                                  const std::vector<std::string>& warnings) {
     std::vector<std::string> mutable_warnings = warnings;
     std::string response_text;
+    std::string response_reasoning;
     json content_blocks = json::array();
     std::string stop_reason = "end_turn";
     std::string response_id = openai_response.value("id", generate_anthropic_message_id());
@@ -713,6 +735,11 @@ json OllamaApi::convert_openai_chat_to_anthropic(const json& openai_response,
 
         if (choice.contains("message") && choice["message"].is_object()) {
             const auto& message = choice["message"];
+            if (message.contains("reasoning_content") && message["reasoning_content"].is_string()) {
+                response_reasoning = message["reasoning_content"].get<std::string>();
+            } else if (message.contains("reasoning") && message["reasoning"].is_string()) {
+                response_reasoning = message["reasoning"].get<std::string>();
+            }
             if (message.contains("content") && message["content"].is_string()) {
                 response_text = message["content"].get<std::string>();
             } else if (message.contains("content") && message["content"].is_array()) {
@@ -765,6 +792,13 @@ json OllamaApi::convert_openai_chat_to_anthropic(const json& openai_response,
         content_blocks = merged_blocks;
     }
 
+    if (!response_reasoning.empty()) {
+        json with_reasoning = json::array();
+        with_reasoning.push_back({{"type", "thinking"}, {"thinking", response_reasoning}});
+        for (const auto& block : content_blocks) with_reasoning.push_back(block);
+        content_blocks = std::move(with_reasoning);
+    }
+
     if (stop_reason == "end_turn") {
         for (const auto& block : content_blocks) {
             if (block.is_object() && block.value("type", "") == "tool_use") {
@@ -803,339 +837,137 @@ json OllamaApi::convert_openai_chat_to_anthropic(const json& openai_response,
     return anthropic_res;
 }
 
-void OllamaApi::stream_openai_sse_to_anthropic_sse(const std::string& openai_body,
+void anthropic::stream_openai_sse_to_anthropic_sse(const std::string& openai_body,
                                                    httplib::DataSink& client_sink,
                                                    const std::string& model,
                                                    const std::vector<std::string>& warnings,
-                                                   StreamFn call_router) {
+                                                   anthropic::StreamFn call_router) {
     httplib::DataSink adapter_sink;
-    std::string sse_buffer;
-
-    bool sent_message_start = false;
-    bool sent_text_content_start = false;
-    bool sent_text_content_stop = false;
-    bool sent_error = false;
-    std::vector<bool> started_tool_blocks;
-    std::vector<bool> stopped_tool_blocks;
-    std::vector<std::string> tool_ids;
-    std::vector<std::string> tool_names;
-    std::string stop_reason = "end_turn";
-    int input_tokens = 0;
-    int output_tokens = 0;
-    std::string message_id = generate_anthropic_message_id();
-
+    std::string buffer, stop_reason = "end_turn";
+    bool started = false, failed = false, finished = false;
+    int next_index = 0, active_index = -1;
+    std::string active_kind;
+    int input_tokens = 0, output_tokens = 0;
+    struct ToolBlock { int index; std::string id; std::string name; };
+    std::map<int, ToolBlock> tools;
+    auto emit = [&](const std::string& event, const json& data) {
+        if (failed) return false;
+        if (!write_sse_event(client_sink, event, data)) { failed = true; return false; }
+        return true;
+    };
+    auto close_active = [&]() {
+        if (active_index < 0) return true;
+        if (!emit("content_block_stop", {{"type", "content_block_stop"}, {"index", active_index}})) return false;
+        active_index = -1;
+        active_kind.clear();
+        return true;
+    };
+    auto fail = [&](const std::string& message) {
+        if (!failed) write_sse_event(client_sink, "error", {{"type", "error"}, {"error", {{"type", "api_error"}, {"message", message}}}});
+        failed = true;
+    };
+    auto content_delta = [&](const std::string& kind, const std::string& text) {
+        if (text.empty()) return true;
+        if (active_kind != kind) {
+            if (!close_active()) return false;
+            active_kind = kind;
+            active_index = next_index++;
+            const std::string field = kind == "thinking" ? "thinking" : "text";
+            if (!emit("content_block_start", {{"type", "content_block_start"}, {"index", active_index}, {"content_block", {{"type", kind}, {field, ""}}}})) return false;
+        }
+        const std::string field = kind == "thinking" ? "thinking" : "text";
+        return emit("content_block_delta", {{"type", "content_block_delta"}, {"index", active_index}, {"delta", {{"type", kind == "thinking" ? "thinking_delta" : "text_delta"}, {field, text}}}});
+    };
     adapter_sink.is_writable = client_sink.is_writable;
-
-    adapter_sink.write = [&client_sink,
-                          &sse_buffer,
-                          &sent_message_start,
-                          &sent_text_content_start,
-                          &sent_text_content_stop,
-                          &sent_error,
-                          &started_tool_blocks,
-                          &stopped_tool_blocks,
-                          &tool_ids,
-                          &tool_names,
-                          &stop_reason,
-                          &input_tokens,
-                          &output_tokens,
-                          &message_id,
-                          &model](const char* data, size_t len) -> bool {
-        sse_buffer.append(data, len);
-
+    adapter_sink.write = [&](const char* data, size_t len) {
+        if (failed) return false;
+        buffer.append(data, len);
         size_t pos;
-        while ((pos = sse_buffer.find('\n')) != std::string::npos) {
-            std::string line = sse_buffer.substr(0, pos);
-            sse_buffer.erase(0, pos + 1);
-
-            if (!line.empty() && line.back() == '\r') {
-                line.pop_back();
-            }
-
-            if (line.empty() || line.find("data: ") != 0) {
-                continue;
-            }
-
-            std::string json_str = line.substr(6);
-            if (json_str == "[DONE]") {
-                continue;
-            }
-
+        while ((pos = buffer.find('\n')) != std::string::npos) {
+            std::string line = buffer.substr(0, pos);
+            buffer.erase(0, pos + 1);
+            if (!line.empty() && line.back() == '\r') line.pop_back();
+            if (line.rfind("data:", 0) != 0) continue;
+            std::string payload = line.substr(5);
+            if (!payload.empty() && payload[0] == ' ') payload.erase(0, 1);
+            if (payload == "[DONE]") continue;
             try {
-                auto openai_chunk = json::parse(json_str);
-
-                if (openai_chunk.contains("error")) {
-                    const auto& error = openai_chunk["error"];
-                    std::cerr << "[OllamaApi] Backend error in Anthropic stream: "
-                              << error.dump() << std::endl;
-                    sent_error = true;
-                    write_sse_event(client_sink, "error",
-                                    anthropic::build_anthropic_error(
-                                        error, anthropic::backend_error_http_status(error)));
-                    return false;
+                const auto chunk = json::parse(payload);
+                if (chunk.contains("error")) { fail(chunk["error"].dump()); return false; }
+                if (!started) {
+                    if (!emit("message_start", {{"type", "message_start"}, {"message", {
+                        {"id", chunk.value("id", generate_anthropic_message_id())}, {"type", "message"},
+                        {"role", "assistant"}, {"model", model}, {"content", json::array()},
+                        {"stop_reason", nullptr}, {"stop_sequence", nullptr},
+                        {"usage", {{"input_tokens", 0}, {"output_tokens", 0}}}
+                    }}})) return false;
+                    started = true;
                 }
-
-                if (!sent_message_start) {
-                    if (openai_chunk.contains("id") && openai_chunk["id"].is_string()) {
-                        message_id = openai_chunk["id"].get<std::string>();
+                if (chunk.contains("usage") && chunk["usage"].is_object()) {
+                    input_tokens = chunk["usage"].value("prompt_tokens", input_tokens);
+                    output_tokens = chunk["usage"].value("completion_tokens", output_tokens);
+                }
+                if (!chunk.contains("choices") || !chunk["choices"].is_array() || chunk["choices"].empty()) continue;
+                const auto& choice = chunk["choices"][0];
+                if (choice.contains("delta") && choice["delta"].is_object()) {
+                    const auto& delta = choice["delta"];
+                    if (delta.contains("reasoning_content") && delta["reasoning_content"].is_string()) {
+                        if (!content_delta("thinking", delta["reasoning_content"].get<std::string>())) return false;
+                    } else if (delta.contains("reasoning") && delta["reasoning"].is_string()) {
+                        if (!content_delta("thinking", delta["reasoning"].get<std::string>())) return false;
                     }
-
-                    json message_start = {
-                        {"type", "message_start"},
-                        {"message", {
-                            {"id", message_id},
-                            {"type", "message"},
-                            {"role", "assistant"},
-                            {"model", model},
-                            {"content", json::array()},
-                            {"stop_reason", nullptr},
-                            {"stop_sequence", nullptr},
-                            {"usage", {{"input_tokens", 0}, {"output_tokens", 0}}}
-                        }}
-                    };
-                    if (!write_sse_event(client_sink, "message_start", message_start)) {
-                        return false;
+                    if (delta.contains("content") && delta["content"].is_string()) {
+                        if (!content_delta("text", delta["content"].get<std::string>())) return false;
                     }
-                    sent_message_start = true;
-                }
-
-                if (openai_chunk.contains("usage") && openai_chunk["usage"].is_object()) {
-                    const auto& usage = openai_chunk["usage"];
-                    input_tokens = usage.value("prompt_tokens", input_tokens);
-                    output_tokens = usage.value("completion_tokens", output_tokens);
-                }
-
-                if (openai_chunk.contains("choices") && openai_chunk["choices"].is_array() &&
-                    !openai_chunk["choices"].empty()) {
-                    const auto& choice = openai_chunk["choices"][0];
-
-                    if (choice.contains("delta") && choice["delta"].is_object()) {
-                        const auto& delta = choice["delta"];
-                        if (delta.contains("content") && delta["content"].is_string()) {
-                            std::string delta_text = delta["content"].get<std::string>();
-                            if (!delta_text.empty()) {
-                                if (!sent_text_content_start) {
-                                    json content_start = {
-                                        {"type", "content_block_start"},
-                                        {"index", 0},
-                                        {"content_block", {{"type", "text"}, {"text", ""}}}
-                                    };
-                                    if (!write_sse_event(client_sink, "content_block_start", content_start)) {
-                                        return false;
-                                    }
-                                    sent_text_content_start = true;
-                                }
-
-                                json content_delta = {
-                                    {"type", "content_block_delta"},
-                                    {"index", 0},
-                                    {"delta", {{"type", "text_delta"}, {"text", delta_text}}}
-                                };
-                                if (!write_sse_event(client_sink, "content_block_delta", content_delta)) {
-                                    return false;
-                                }
+                    if (delta.contains("tool_calls") && delta["tool_calls"].is_array()) {
+                        for (const auto& tool : delta["tool_calls"]) {
+                            const int source_index = tool.value("index", 0);
+                            if (source_index < 0) throw std::invalid_argument("negative tool index");
+                            const auto fn = tool.value("function", json::object());
+                            auto it = tools.find(source_index);
+                            if (it == tools.end()) {
+                                const auto name = fn.value("name", std::string());
+                                if (name.empty()) throw std::invalid_argument("tool stream started without function name");
+                                if (!close_active()) return false;
+                                ToolBlock block{next_index++, tool.value("id", generate_anthropic_message_id()), name};
+                                it = tools.emplace(source_index, block).first;
+                                if (!emit("content_block_start", {{"type", "content_block_start"}, {"index", block.index}, {"content_block", {
+                                    {"type", "tool_use"}, {"id", block.id}, {"name", block.name}, {"input", json::object()}
+                                }}})) return false;
+                            } else if ((tool.contains("id") && tool["id"] != it->second.id) ||
+                                       (fn.contains("name") && fn["name"] != it->second.name)) {
+                                throw std::invalid_argument("tool identity changed during stream");
                             }
-                        }
-
-                        if (delta.contains("tool_calls") && delta["tool_calls"].is_array()) {
-                            for (const auto& tool_delta : delta["tool_calls"]) {
-                                if (!tool_delta.is_object()) {
-                                    continue;
-                                }
-
-                                int openai_tool_index = tool_delta.value("index", 0);
-                                if (openai_tool_index < 0) {
-                                    continue;
-                                }
-
-                                size_t idx = static_cast<size_t>(openai_tool_index);
-                                if (started_tool_blocks.size() <= idx) {
-                                    started_tool_blocks.resize(idx + 1, false);
-                                    stopped_tool_blocks.resize(idx + 1, false);
-                                    tool_ids.resize(idx + 1);
-                                    tool_names.resize(idx + 1);
-                                }
-
-                                if (tool_delta.contains("id") && tool_delta["id"].is_string()) {
-                                    tool_ids[idx] = tool_delta["id"].get<std::string>();
-                                }
-
-                                if (tool_delta.contains("function") && tool_delta["function"].is_object()) {
-                                    const auto& fn = tool_delta["function"];
-                                    if (fn.contains("name") && fn["name"].is_string()) {
-                                        tool_names[idx] = fn["name"].get<std::string>();
-                                    }
-                                }
-
-                                if (!started_tool_blocks[idx]) {
-                                    if (tool_ids[idx].empty()) {
-                                        tool_ids[idx] = generate_anthropic_message_id();
-                                    }
-                                    if (tool_names[idx].empty()) {
-                                        tool_names[idx] = "unknown_tool";
-                                    }
-
-                                    json tool_block_start = {
-                                        {"type", "content_block_start"},
-                                        {"index", static_cast<int>(idx) + 1},
-                                        {"content_block", {
-                                            {"type", "tool_use"},
-                                            {"id", tool_ids[idx]},
-                                            {"name", tool_names[idx]},
-                                            {"input", json::object()}
-                                        }}
-                                    };
-                                    if (!write_sse_event(client_sink, "content_block_start", tool_block_start)) {
-                                        return false;
-                                    }
-                                    started_tool_blocks[idx] = true;
-                                }
-
-                                if (tool_delta.contains("function") && tool_delta["function"].is_object()) {
-                                    const auto& fn = tool_delta["function"];
-                                    if (fn.contains("arguments") && fn["arguments"].is_string()) {
-                                        std::string args_delta = fn["arguments"].get<std::string>();
-                                        if (!args_delta.empty()) {
-                                            json tool_input_delta = {
-                                                {"type", "content_block_delta"},
-                                                {"index", static_cast<int>(idx) + 1},
-                                                {"delta", {
-                                                    {"type", "input_json_delta"},
-                                                    {"partial_json", args_delta}
-                                                }}
-                                            };
-                                            if (!write_sse_event(client_sink, "content_block_delta", tool_input_delta)) {
-                                                return false;
-                                            }
-                                        }
-                                    }
-                                }
+                            if (fn.contains("arguments") && fn["arguments"].is_string() && !fn["arguments"].get<std::string>().empty()) {
+                                if (!emit("content_block_delta", {{"type", "content_block_delta"}, {"index", it->second.index}, {"delta", {
+                                    {"type", "input_json_delta"}, {"partial_json", fn["arguments"]}
+                                }}})) return false;
                             }
                         }
                     }
-
-                    if (choice.contains("finish_reason") && !choice["finish_reason"].is_null()) {
-                        stop_reason = map_finish_reason_to_anthropic_stop_reason(choice);
-                    }
                 }
-            } catch (const std::exception& e) {
-                std::cerr << "[OllamaApi] Failed to parse Anthropic stream chunk: " << e.what() << std::endl;
-            }
+                if (choice.contains("finish_reason") && !choice["finish_reason"].is_null()) {
+                    stop_reason = map_finish_reason_to_anthropic_stop_reason(choice);
+                    finished = true;
+                }
+            } catch (const std::exception& e) { fail(e.what()); return false; }
         }
         return true;
     };
-
-    adapter_sink.done = [&client_sink,
-                         &sent_message_start,
-                         &sent_text_content_start,
-                         &sent_text_content_stop,
-                         &sent_error,
-                         &started_tool_blocks,
-                         &stopped_tool_blocks,
-                         &stop_reason,
-                         &input_tokens,
-                         &output_tokens,
-                         &warnings]() {
-        // The error event terminates the stream. Emitting the closing frames
-        // here would let a client read the failure as a turn that produced no
-        // content, which is the state this path exists to avoid.
-        if (sent_error) {
-            client_sink.done();
-            return;
+    adapter_sink.done = [&]() {
+        if (!failed && (!started || !finished || !buffer.empty())) fail("Backend stream ended without a complete terminal response");
+        if (failed) { client_sink.done(); return; }
+        if (!close_active()) { client_sink.done(); return; }
+        for (const auto& entry : tools) {
+            if (!emit("content_block_stop", {{"type", "content_block_stop"}, {"index", entry.second.index}})) { client_sink.done(); return; }
         }
-
-        if (!sent_message_start) {
-            json message_start = {
-                {"type", "message_start"},
-                {"message", {
-                    {"id", generate_anthropic_message_id()},
-                    {"type", "message"},
-                    {"role", "assistant"},
-                    {"content", json::array()},
-                    {"stop_reason", nullptr},
-                    {"stop_sequence", nullptr},
-                    {"usage", {{"input_tokens", 0}, {"output_tokens", 0}}}
-                }}
-            };
-            if (!write_sse_event(client_sink, "message_start", message_start)) {
-                client_sink.done();
-                return;
-            }
-            sent_message_start = true;
-        }
-
-        if (!sent_text_content_start && started_tool_blocks.empty()) {
-            json content_start = {
-                {"type", "content_block_start"},
-                {"index", 0},
-                {"content_block", {{"type", "text"}, {"text", ""}}}
-            };
-            if (!write_sse_event(client_sink, "content_block_start", content_start)) {
-                client_sink.done();
-                return;
-            }
-            sent_text_content_start = true;
-        }
-
-        if (sent_text_content_start && !sent_text_content_stop) {
-            json content_stop = {
-                {"type", "content_block_stop"},
-                {"index", 0}
-            };
-            if (!write_sse_event(client_sink, "content_block_stop", content_stop)) {
-                client_sink.done();
-                return;
-            }
-            sent_text_content_stop = true;
-        }
-
-        for (size_t idx = 0; idx < started_tool_blocks.size(); ++idx) {
-            if (started_tool_blocks[idx] && !stopped_tool_blocks[idx]) {
-                json tool_stop = {
-                    {"type", "content_block_stop"},
-                    {"index", static_cast<int>(idx) + 1}
-                };
-                if (!write_sse_event(client_sink, "content_block_stop", tool_stop)) {
-                    client_sink.done();
-                    return;
-                }
-                stopped_tool_blocks[idx] = true;
-            }
-        }
-
-        if (stop_reason == "end_turn") {
-            for (bool started : started_tool_blocks) {
-                if (started) {
-                    stop_reason = "tool_use";
-                    break;
-                }
-            }
-        }
-
-        json message_delta = {
-            {"type", "message_delta"},
-            {"delta", {
-                {"stop_reason", stop_reason},
-                {"stop_sequence", nullptr}
-            }},
-            {"usage", {
-                {"input_tokens", input_tokens},
-                {"output_tokens", output_tokens}
-            }}
-        };
-        if (!warnings.empty()) {
-            message_delta["warnings"] = warnings;
-        }
-        if (!write_sse_event(client_sink, "message_delta", message_delta)) {
-            client_sink.done();
-            return;
-        }
-
-        json message_stop = {{"type", "message_stop"}};
-        write_sse_event(client_sink, "message_stop", message_stop);
+        if (stop_reason == "end_turn" && !tools.empty()) stop_reason = "tool_use";
+        json message_delta = {{"type", "message_delta"}, {"delta", {{"stop_reason", stop_reason}, {"stop_sequence", nullptr}}},
+                              {"usage", {{"input_tokens", input_tokens}, {"output_tokens", output_tokens}}}};
+        if (!warnings.empty()) message_delta["warnings"] = warnings;
+        if (emit("message_delta", message_delta)) emit("message_stop", {{"type", "message_stop"}});
         client_sink.done();
     };
-
     call_router(openai_body, adapter_sink);
 }
 
@@ -1185,7 +1017,13 @@ void OllamaApi::handle_anthropic_messages(const httplib::Request& req, httplib::
             return;
         }
 
-        auto openai_req = convert_anthropic_to_openai_chat(request_json, warnings);
+        json openai_req;
+        try {
+            openai_req = anthropic::convert_anthropic_to_openai_chat(request_json, warnings);
+        } catch (const std::invalid_argument& e) {
+            set_anthropic_error_response(res, 400, e.what());
+            return;
+        }
 
         try {
             auto_load_model(model, extract_auto_load_options(request_json));
@@ -1221,7 +1059,7 @@ void OllamaApi::handle_anthropic_messages(const httplib::Request& req, httplib::
                 [this, openai_body, model, warnings](size_t offset, httplib::DataSink& sink) {
                     if (offset > 0) return false;
 
-                    stream_openai_sse_to_anthropic_sse(openai_body, sink, model, warnings,
+                    anthropic::stream_openai_sse_to_anthropic_sse(openai_body, sink, model, warnings,
                         [this](const std::string& body, httplib::DataSink& s) {
                             router_->chat_completion_stream(body, s);
                         }
@@ -1239,7 +1077,7 @@ void OllamaApi::handle_anthropic_messages(const httplib::Request& req, httplib::
             return;
         }
 
-        auto anthropic_response = convert_openai_chat_to_anthropic(openai_response, model, warnings);
+        auto anthropic_response = anthropic::convert_openai_chat_to_anthropic(openai_response, model, warnings);
         res.set_content(anthropic_response.dump(), "application/json");
 
     } catch (const std::exception& e) {
