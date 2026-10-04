@@ -344,3 +344,53 @@ transport test does not establish any private codec's correctness, numerical ARC
 parity, real Qwen inference, or the local llama.cpp subprocess seam. Those require
 separate composition evidence against the selected package, codec and runtime.
 Responses ingress remains unsupported by session collections.
+
+### Start an installed session runtime
+
+If your ARC deployment supplies a separate session-runtime bundle, install its
+pinned build into a new private directory. Keep the package manifest, provider
+settings and full action catalog outside this repository. The bundle does not
+include an ARC encoder, heads, model weights or provider credentials. Its
+numerical policy endpoint must already be running.
+
+Use unused ports and isolated runtime/server configuration when testing beside
+existing agent sessions. These steps require no global client settings changes.
+
+Set `ARC_RUNTIME` to the installation directory and the other variables below
+to your private settings file, package manifest and package alias. Then inspect
+the settings-bound codec identity with the installed launcher:
+
+```sh
+"$ARC_RUNTIME/arc-session" --settings "$ARC_SETTINGS" --package "$ARC_PACKAGE" \
+  --package-alias "$ARC_PACKAGE_ALIAS" --describe-config
+```
+
+Copy the returned `codec_sha256` into the collection's `routing.router.session`.
+It covers the installed codec and configured provider/backend profiles; it is
+not just the hash of a worker executable. Start that same installation and
+settings with `--policy-endpoint http://127.0.0.1:9012/v1/rayline/arc/policy/decide
+--port 9013`, retaining the other arguments above. Point the collection's session
+`endpoint` at `http://127.0.0.1:9013/experimental/arc/session`. Import the collection
+through the ordinary CLI or desktop flow described above. Starting the session
+service does not qualify its external numerical worker.
+
+For a local llama.cpp destination, keep the registered Lemonade alias,
+`wire_model` and backend response model identical. The supported per-load
+`llamacpp_args` setting can pass `--alias <registered alias>`; verify the owned
+backend command and `/props.model_alias` before use. A usage profile must be
+bound to the actual backend revision, executable and dependency identity. Do not
+apply a llama profile to an arbitrary Chat endpoint. Use the profile's supported
+context size explicitly rather than inheriting a large model default.
+
+The source-backed llama profile can report prompt/cache/output counts from early
+timing frames, then check them against final provider usage. It leaves
+cache-creation fields absent when the source native usage does not supply them.
+Generic Chat accounting may need to wait for final usage
+and refuse an unknown cache partition. Missing usage is never evidence of zero.
+Changing backend profiles requires a new settings-bound pin and qualification.
+
+The current session service keeps state in memory. Preserve an uncertain receipt
+for reconciliation; restarting or changing a session ID does not prove it safe to
+retry. Numerical ARC parity, durable recovery, Responses ingress and real-provider
+cache behavior remain separate acceptance requirements. This setup is an
+experimental integration, not a claim that the whole deployment is launch-ready.
