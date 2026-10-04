@@ -57,6 +57,7 @@ require.extensions['.ts'] = function loadTypeScript(module, filename) {
 };
 
 const { appendChatDelta, chatHistoryMessage } = require(path.join(appRoot, 'src', 'renderer', 'utils', 'chatWireMessage.ts'));
+const { chatResponseError } = require(path.join(appRoot, 'src', 'renderer', 'utils', 'chatResponseError.ts'));
 const { createChatRequestIdentity } = require(path.join(appRoot, 'src', 'renderer', 'utils', 'chatRequestIdentity.ts'));
 
 const collectionUtils = require(
@@ -1521,6 +1522,42 @@ tests.push({
     const display = { role: 'assistant', content: 'Visible answer', thinking: 'UI-only', wireMessage: wire };
     assert.deepEqual(chatHistoryMessage(display), { role: 'assistant', content: '<think>Plan</think>Visible answer', reasoning: 'Think carefully.', reasoning_details: [{ index: 0, type: 'reasoning.text', text: 'Think carefully.', signature: 'sig-end' }], tool_calls: [{ id: 'call-1', type: 'function', function: { name: 'lookup', arguments: '{"q":"x"}' } }] });
     assert.deepEqual(chatHistoryMessage({ role: 'assistant', content: 'Legacy', thinking: 'UI-only' }), { role: 'assistant', content: 'Legacy' });
+  },
+});
+tests.push({
+  name: 'native ARC session setup round-trips without diagnostic endpoint and refuses malformed sessions',
+  run() {
+    const action = 'a'.repeat(64);
+    const routing = { candidates: ['Model-A'], default_model: 'Model-A', router: {
+      type: 'arc', package: { alias: 'synthetic', package_sha256: 'b'.repeat(64) },
+      session: { endpoint: 'http://127.0.0.1:9011/experimental/arc/session', owner_id: 'owner', codec_sha256: 'd'.repeat(64) },
+      actions: { [action]: { model: 'Model-A', wire_model: 'provider/model', reasoning_effort: null, reasoning_max_tokens: 128, steering_suffix: 'private instruction' } },
+    } };
+    const draft = parse('user.Arc', routing, ['Model-A']);
+    assert.equal(collectionUtils.validateRouterDraftStructure(draft), null);
+    assert.deepEqual(build(draft).routing, routing);
+    const saved = build({ ...draft, name: 'Renamed' });
+    assert.equal(saved.model_name, 'user.Arc', 'editing preserves the existing router identity');
+    assert.deepEqual(validateImport(saved).routing, routing);
+    assert.equal(build({ ...draft, id: undefined, name: 'NewArc' }).model_name, 'user.NewArc');
+    for (const session of [null, {}, { ...routing.router.session, endpoint: 'https://external.example/session' }, { ...routing.router.session, owner_id: '' }, { ...routing.router.session, owner_id: 'é'.repeat(129) }, { ...routing.router.session, codec_sha256: 'bad' }]) {
+      const changed = { ...draft, arcRouter: { ...draft.arcRouter, endpoint: 'http://127.0.0.1:9011/v1/rayline/arc/policy/decide', session } };
+      assert.match(collectionUtils.validateRouterDraftStructure(changed), /ARC session/);
+      assert.throws(() => build(changed), /ARC session/);
+    }
+    for (const mutation of [{ wire_model: '' }, { reasoning_effort: 1 }, { reasoning_max_tokens: -1 }, { steering_suffix: null }]) {
+      const changed = { ...draft, arcRouter: { ...draft.arcRouter, actions: { [action]: { ...routing.router.actions[action], ...mutation } } } };
+      assert.notEqual(collectionUtils.validateRouterDraftStructure(changed), null);
+    }
+  },
+});
+tests.push({
+  name: 'chat refusal keeps actionable session errors and falls back for missing error detail',
+  async run() {
+    assert.match((await chatResponseError({ status: 503, json: async () => ({ error: 'ARC session runtime is unavailable' }) })).message, /ARC session runtime is unavailable/);
+    assert.match((await chatResponseError({ status: 409, json: async () => ({ error: { message: 'Settlement uncertain' } }) })).message, /Settlement uncertain/);
+    assert.equal((await chatResponseError({ status: 500, json: async () => ({}) })).message, 'HTTP error! status: 500');
+    assert.equal((await chatResponseError({ status: 502, json: async () => { throw Error('not JSON'); } })).message, 'HTTP error! status: 502');
   },
 });
 module.exports = { tests };

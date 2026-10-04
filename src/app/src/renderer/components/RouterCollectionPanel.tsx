@@ -816,8 +816,12 @@ const RouterCollectionPanel: React.FC<RouterCollectionPanelProps> = ({
           <label className="form-label">Router Name *</label>
           <input type="text" className="form-input"
             value={draft.name}
+            readOnly={mode === 'edit'}
             onChange={e => patch({ name: e.target.value.replace(/^user\./, '') })}
             placeholder="MyHybridRouter" />
+          {mode === 'edit' && (
+            <p className="settings-description">The name identifies this saved router and cannot be changed. Create a new router to use a different name.</p>
+          )}
           {draft.name.trim() && (
             <span className="settings-description" style={{ display: 'block', marginTop: 3, fontFamily: 'monospace', fontSize: '0.7rem' }}>
               ID: {makeCollectionId(draft.name)}
@@ -945,7 +949,7 @@ const RouterCollectionPanel: React.FC<RouterCollectionPanelProps> = ({
               } catch (error) { showError(error instanceof Error ? error.message : 'Could not import ARC setup.'); }
             }} />
             {draft.arcRouter && <p className="settings-description">Package: {draft.arcRouter.package?.alias}. {Object.keys(draft.arcRouter.actions ?? {}).length} configured actions.</p>}
-            <p className="settings-description">Test a saved conversation in the Test Prompt tab. Desktop chat requires a runtime integration that supplies conversation context; steering actions are not yet supported by this adapter.</p>
+            <p className="settings-description">{draft.arcRouter?.session ? 'Save this router, select it in Chat, and send a message. The local ARC session runtime routes each turn and manages private steering.' : 'This diagnostic setup tests saved conversations. Import a session setup from your local ARC runtime to use ordinary Chat.'}</p>
           </div>
         )}
         {draft.routingMode === 'llm' && (
@@ -1036,7 +1040,12 @@ const RouterCollectionPanel: React.FC<RouterCollectionPanelProps> = ({
         </div>
       )}
           </>}
-          testPrompt={draft.routingMode === 'arc' ?
+          testPrompt={draft.routingMode === 'arc' && draft.arcRouter?.session ?
+            <div className="settings-content custom-collection-content"><div className="form-section">
+              <label className="form-label">Try this router in Chat</label>
+              <p className="settings-description">Save this router, select it in Chat, and send a message. Conversation context is supplied automatically by this app.</p>
+              {testUnavailableReason && <p role="status">{testUnavailableReason}</p>}
+            </div></div> : draft.routingMode === 'arc' ?
             <ArcRouterTestPanel policy={testPolicy} unavailableReason={testUnavailableReason} /> :
             <RouterTestPromptPanel
               policy={testPolicy}

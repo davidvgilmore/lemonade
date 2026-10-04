@@ -1,5 +1,6 @@
 import { appendChatDelta, chatHistoryMessage, ChatWireMessage } from '../../utils/chatWireMessage';
 import { createChatRequestIdentity } from '../../utils/chatRequestIdentity';
+import { chatResponseError } from '../../utils/chatResponseError';
 import React, { useState, useEffect, useRef, useMemo } from 'react';
 import MarkdownMessage from '../../MarkdownMessage';
 import AudioButton from '../../AudioButton';
@@ -659,7 +660,7 @@ const LLMChatPanel: React.FC<LLMChatPanelProps> = ({
         signal: abortControllerRef.current?.signal,
       });
 
-      if (!response.ok) throw new Error(`HTTP error! status: ${response.status}`);
+      if (!response.ok) throw await chatResponseError(response);
       const data = await response.json();
 
       // Notify UI that model is loaded on first response
@@ -863,7 +864,7 @@ const LLMChatPanel: React.FC<LLMChatPanelProps> = ({
       signal: abortControllerRef.current!.signal,
     });
 
-    if (!response.ok) throw new Error(`HTTP error! status: ${response.status}`);
+    if (!response.ok) throw await chatResponseError(response);
     if (!response.body) throw new Error('Response body is null');
 
     const reader = response.body.getReader();
