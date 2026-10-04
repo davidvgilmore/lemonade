@@ -53,7 +53,6 @@ class ServerConfig {
           const trimmedOrigin = origin.replace(/\/+$/, '');
           console.log('Using web app origin as server base URL:', trimmedOrigin);
           this.explicitBaseUrl = trimmedOrigin;
-          this.initialized = true;
           return;
         }
       }
@@ -64,7 +63,6 @@ class ServerConfig {
         if (baseUrl) {
           console.log('Using explicit server base URL:', baseUrl);
           this.explicitBaseUrl = baseUrl;
-          this.initialized = true;
           return;
         }
       }
@@ -78,32 +76,32 @@ class ServerConfig {
       }
 
       console.log('Using localhost mode with port:', this.port);
-      this.initialized = true;
     } catch (error) {
       console.error('Failed to initialize server config:', error);
+    } finally {
       this.initialized = true;
-    }
+      // Register event listeners AFTER the first await-cycle so window.api is
+      // guaranteed to be installed. tauriShim.ts installs window.api via a
+      // fire-and-forget async call that completes on the microtask queue; the
+      // constructor runs synchronously during module-graph evaluation and would
+      // see window.api as undefined if we registered there.
+      if (typeof window !== 'undefined' && window.api?.onServerPortUpdated && window.api?.onConnectionSettingsUpdated) {
+        window.api.onServerPortUpdated((port: number) => {
+          if (!this.explicitBaseUrl) {
+            this.setPort(port);
+          }
+        });
 
-    // Register event listeners AFTER the first await-cycle so window.api is
-    // guaranteed to be installed. tauriShim.ts installs window.api via a
-    // fire-and-forget async call that completes on the microtask queue; the
-    // constructor runs synchronously during module-graph evaluation and would
-    // see window.api as undefined if we registered there.
-    if (typeof window !== 'undefined' && window.api?.onServerPortUpdated && window.api?.onConnectionSettingsUpdated) {
-      window.api.onServerPortUpdated((port: number) => {
-        if (!this.explicitBaseUrl) {
-          this.setPort(port);
-        }
-      });
-
-      window.api.onConnectionSettingsUpdated((baseURL: string, apiKey: string) => {
-        if (this.explicitBaseUrl != baseURL) {
-          this.setUpdatedURL(baseURL);
-        }
-        if (this.apiKey != apiKey) {
-          this.setUpdatedAPIKey(apiKey);
-        }
-      });
+        window.api.onConnectionSettingsUpdated((baseURL: string, apiKey: string) => {
+          if (this.explicitBaseUrl != baseURL) {
+            this.setUpdatedURL(baseURL);
+          }
+          if (this.apiKey != apiKey) {
+            this.setUpdatedAPIKey(apiKey);
+          }
+        });
+      }
+      this.notifyUrlListeners();
     }
   }
 
