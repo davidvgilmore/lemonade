@@ -17,6 +17,7 @@
 #include <utility>
 #include "lemon/auto_tune.h"
 #include "lemon/backend_manager.h"
+#include "lemon/prepared_request.h"
 #include "lemon/runtime_config.h"
 #include "lemon/utils/custom_args.h"
 #include "lemon/utils/recipe_arg_resolver.h"
@@ -606,6 +607,9 @@ json LlamaCppServer::normalize_response_model(json response, const json& request
 }
 
 json LlamaCppServer::chat_completion(const json& request) {
+    if (const auto* prepared = PreparedRequestScope::current()) {
+        return normalize_response_model(forward_request("/v1/chat/completions", *prepared), request);
+    }
     return normalize_response_model(
         forward_request("/v1/chat/completions",
                         llamacpp::sanitize_tool_schema_limits(
@@ -654,6 +658,11 @@ void LlamaCppServer::forward_streaming_request(const std::string& endpoint,
                                                long timeout_seconds,
                                                TelemetryCallback telemetry_callback) {
     std::string body = request_body;
+    if (const auto* prepared = PreparedRequestScope::current()) {
+        if (endpoint != "/v1/chat/completions") throw std::invalid_argument("Prepared transport requires native Chat");
+        WrappedServer::forward_streaming_request(endpoint, prepared->dump(), sink, sse, timeout_seconds, telemetry_callback);
+        return;
+    }
     if (endpoint == "/v1/chat/completions" || endpoint == "/v1/responses") {
         json request = json::parse(request_body, nullptr, false);
         if (!request.is_discarded()) {

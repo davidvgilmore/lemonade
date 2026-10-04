@@ -450,8 +450,14 @@ NamedLeafFactories make_deterministic_leaf_factories();
 
 // The parsed, resolved routing policy (produced by the parser). Classifier
 // condition refs in the rules resolve against `classifiers` by id.
+struct ArcSessionConfig {
+    std::string endpoint;
+    std::string owner_id;
+};
+
 struct RoutePolicy {
     std::optional<json> arc_router;
+    std::optional<ArcSessionConfig> arc_session;
     std::vector<std::string> candidates;                 // routing targets
     std::string default_model;                           // fail-open target ∈ candidates
     std::vector<Rule> rules;                             // ordered, first-match-wins

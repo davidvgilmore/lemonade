@@ -2042,6 +2042,7 @@ jobs:
         run: |
           .venv/bin/python -m test.utils.reset_server_state --best-effort --label "ubuntu router"
           .venv/bin/python test/server_router.py --cli-binary lemonade
+          .venv/bin/python test/server_arc_session.py --cli-binary lemonade
 
       # The full smoke test can be added to a different GPU equipped pipeline
       # as well if needed, but it would significantly add to the pipeline runtime.
@@ -2283,6 +2284,7 @@ jobs:
         run: |
           $VENV_PYTHON -m test.utils.reset_server_state --best-effort --label "windows-latest router"
           $VENV_PYTHON test/server_router.py --cli-binary "$CLI_BINARY"
+          $VENV_PYTHON test/server_arc_session.py --cli-binary "$CLI_BINARY"
 
       - name: Test web-app path traversal
         if: ${{ !cancelled() && steps.setup.outcome == 'success' }}
@@ -2470,6 +2472,7 @@ jobs:
         run: |
           $VENV_PYTHON -m test.utils.reset_server_state --best-effort --label "macos-latest router"
           $VENV_PYTHON test/server_router.py --cli-binary "$CLI_BINARY"
+          $VENV_PYTHON test/server_arc_session.py --cli-binary "$CLI_BINARY"
 
       - name: Test web-app path traversal
         if: ${{ !cancelled() && steps.setup.outcome == 'success' }}

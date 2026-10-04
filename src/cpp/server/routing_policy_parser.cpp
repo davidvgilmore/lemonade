@@ -1,6 +1,7 @@
 #include "lemon/routing_policy_parser.h"
 
 #include "lemon/arc_router.h"
+#include "lemon/arc_session.h"
 #include "lemon/model_types.h"
 
 #include <algorithm>
@@ -655,6 +656,7 @@ RoutePolicy parse_route_policy_collection(const json& collection_json,
         }
         json config = routing.at("router");
         validate_arc_router(config);
+        if (config.contains("session")) policy.arc_session = parse_arc_session(config.at("session"));
         for (auto& [action, binding] : config.at("actions").items()) {
             const std::string original = binding.at("model").get<std::string>();
             const std::string resolved = resolve_component(original, options, "routing.router.actions.model");

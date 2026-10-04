@@ -24,12 +24,12 @@ inline bool arc_sha256(const json& value) {
 }
 
 inline void validate_arc_router(const json& config) {
-    const std::set<std::string> keys = {"type", "endpoint", "package", "actions"};
+    const std::set<std::string> keys = {"type", "endpoint", "package", "actions", "session"};
     for (const auto& item : config.items()) {
         arc_require(keys.count(item.key()) != 0, "Unknown ARC router config key");
     }
     arc_require(config.at("type") == "arc", "Expected ARC router type");
-    arc_require(std::regex_match(config.at("endpoint").get<std::string>(),
+    if (!config.contains("session")) arc_require(std::regex_match(config.at("endpoint").get<std::string>(),
         std::regex("http://127\\.0\\.0\\.1:[0-9]{1,5}/v1/rayline/arc/policy/decide")),
         "ARC endpoint must be the policy decision endpoint on numeric loopback");
     const auto& package = config.at("package");
@@ -39,9 +39,13 @@ inline void validate_arc_router(const json& config) {
     arc_require(config.at("actions").is_object() && !config.at("actions").empty(), "ARC actions are required");
     for (const auto& [id, binding] : config.at("actions").items()) {
         arc_require(arc_sha256(id), "ARC action identity must be SHA256");
-        arc_require(binding.is_object() && binding.size() == 4 &&
+        arc_require(binding.is_object() && binding.size() == (config.contains("session") ? 5 : 4) &&
             binding.at("model").is_string() && !binding.at("model").get<std::string>().empty(),
             "ARC binding requires model, reasoning_effort, reasoning_max_tokens, steering_suffix");
+        if (config.contains("session")) {
+            arc_require(binding.at("wire_model").is_string() && !binding.at("wire_model").get<std::string>().empty(),
+                        "ARC session actions require explicit wire_model");
+        }
         arc_require(binding.at("reasoning_effort").is_null() || binding.at("reasoning_effort").is_string(),
             "ARC reasoning_effort must be explicit string or null");
         arc_require(binding.at("steering_suffix").is_string(), "ARC steering_suffix must be explicit text");

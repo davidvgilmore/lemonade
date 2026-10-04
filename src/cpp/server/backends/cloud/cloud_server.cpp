@@ -3,6 +3,7 @@
 #include "lemon/model_manager.h"
 #include "lemon/cloud_provider_registry.h"
 #include "lemon/error_types.h"
+#include "lemon/prepared_request.h"
 #include "lemon/runtime_config.h"
 #include "lemon/streaming_proxy.h"
 #include "lemon/utils/http_client.h"
@@ -514,6 +515,10 @@ std::string CloudServer::insecure_http_sse() const {
 }
 
 json CloudServer::rewrite_model_field(const json& request) const {
+    if (const auto* prepared = PreparedRequestScope::current()) {
+        if (prepared->at("model") != upstream_model_) throw std::invalid_argument("Prepared model differs from registered provider destination");
+        return *prepared;
+    }
     json modified = request;
     modified["model"] = upstream_model_;
     utils::JsonUtils::add_legacy_max_tokens_alias(modified);
@@ -665,6 +670,11 @@ void CloudServer::forward_streaming_request(const std::string& endpoint,
     bool injected_usage = false;
     try {
         json req = json::parse(request_body);
+        const auto* prepared = PreparedRequestScope::current();
+        if (prepared) {
+            if (prepared->at("model") != upstream_model_) throw std::invalid_argument("Prepared model differs from registered provider destination");
+            req = *prepared;
+        } else {
         req["model"] = upstream_model_;
         utils::JsonUtils::add_legacy_max_tokens_alias(req);
         if (sse && (suffix == "/chat/completions" || suffix == "/completions")) {
@@ -676,6 +686,7 @@ void CloudServer::forward_streaming_request(const std::string& endpoint,
                 stream_options["include_usage"] = true;
                 injected_usage = true;
             }
+        }
         }
         forwarded_body = req.dump();
     } catch (const json::exception&) {
@@ -782,11 +793,16 @@ void CloudServer::forward_streaming_request(const std::string& endpoint,
                 }
             };
 
+            int response_status = 0;
             auto result = utils::HttpClient::post_stream(
                 url,
                 forwarded_body,
                 [&](const char* data, size_t length) -> bool {
                     if (length == 0) return true;
+                    if (PreparedRequestScope::current() && response_status != 200) {
+                        body_buffer.append(data, length);
+                        return true;
+                    }
                     if (first_chunk) {
                         first_chunk = false;
                         size_t i = 0;
@@ -811,7 +827,8 @@ void CloudServer::forward_streaming_request(const std::string& endpoint,
                             // whatever usage frames arrive, so relay bytes verbatim.
                             sse_line_buffer.append(data, length);
                             StreamingProxy::process_sse_lines(sse_line_buffer, process_cloud_line);
-                            return sink.write(data, length);
+                            const bool written = sink.write(data, length);
+                            return written && !PreparedRequestScope::terminal_delivered();
                         }
 
                         // include_usage was injected: relay complete lines and
@@ -836,9 +853,12 @@ void CloudServer::forward_streaming_request(const std::string& endpoint,
                 },
                 headers,
                 timeout_seconds,
-                nullptr,
-                creds.policy
+                [&response_status](int status) { response_status = status; },
+                creds.policy,
+                [&sink]() { return PreparedRequestScope::current() && sink.is_writable && !sink.is_writable(); }
             );
+            if (result.curl_code == CURLE_WRITE_ERROR && result.status_code == 200 &&
+                PreparedRequestScope::terminal_delivered()) result.curl_code = CURLE_OK;
 
             if (result.curl_code != CURLE_OK) {
                 if (result.curl_code == CURLE_WRITE_ERROR) {
@@ -886,7 +906,7 @@ void CloudServer::forward_streaming_request(const std::string& endpoint,
             if (!body_buffer.empty()) {
                 sink.write(body_buffer.data(), body_buffer.size());
             }
-            if (!has_done_marker) {
+            if (!has_done_marker && !PreparedRequestScope::current()) {
                 const char* done_marker = "data: [DONE]\n\n";
                 sink.write(done_marker, std::strlen(done_marker));
             }

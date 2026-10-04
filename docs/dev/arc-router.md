@@ -77,7 +77,7 @@ under the release's stated tolerances. A successful adapter round trip alone
 does not establish numerical parity or local model execution. Establish those
 separately from the actual worker's runtime/artifact evidence.
 
-## Chat dispatch
+## Replay Chat dispatch
 
 Register the collection through `/api/v1/pull` and address its name in a chat
 completion. Include `arc_context`, containing the normal decision-request
@@ -93,7 +93,7 @@ After selection, Lemonade applies the configured `reasoning_effort`, strips
 result appears in `x_lemonade_route.outputs.arc`. Native controls are not
 inferred from a model name.
 
-The current dispatch adapter supports OpenAI chat and native `reasoning_effort`.
+The replay dispatch adapter supports OpenAI chat and native `reasoning_effort`.
 Nonempty steering suffixes and reasoning budgets are accepted as explicit
 catalog metadata for decision-only validation. Chat dispatch rejects requests
 with those eligible actions before calling the worker: their provider-specific
@@ -149,20 +149,103 @@ Hugging Face credentials (`HF_TOKEN` or its supported local login). Never put
 credentials in the collection JSON. Lemonade's own model download credentials
 are separate from the ARC runtime's process environment.
 
-The router appears in the normal model picker. Desktop chat currently cannot
-supply the required ARC conversation context by itself. API clients must supply
-`arc_context`; action sets requiring steering or budgets are rejected for chat.
-The local decision test supports those catalog controls without dispatching
-anything. Full ordinary-chat support requires the shared runtime's session and
-steering lifecycle integration and remains unfinished.
+The router appears in the normal model picker. Replay collections require
+`arc_context`; ordinary desktop and CLI requests instead use the opt-in session
+service configuration below.
 
 Desktop chat and `lemonade chat` supply the existing `X-Client-Session-Id`
 header and a fresh `X-Lemonade-Request-Id` for each request attempt. The session
 survives turns, while New Chat and CLI history resets start a new session.
 Independent windows or REPL processes receive independent identities. These
 headers identify requests; they do not attest completion, supply model
-attribution, or commit routing state. The experimental session adapter remains
-outside the public API until its streaming and retry lifecycle is qualified.
+attribution, or commit routing state. The session service owns attribution and the steering ledger; the host settles
+its prepared receipt using the actual response delivery lifecycle.
 
 Run `python test/cli_chat_identity.py` after building the CLI to check both
 streamed and non-streamed requests against a synthetic local HTTP server.
+
+## Ordinary Chat sessions
+
+Add `session` to the ARC router configuration and `wire_model` to every action:
+
+```json
+{
+  "type": "arc",
+  "package": {"alias": "operator-configured-package", "package_sha256": "<64 hex characters>"},
+  "session": {"endpoint": "http://127.0.0.1:18082/v1/rayline/arc/session", "owner_id": "this-lemonade-installation"},
+  "actions": {
+    "<64-character action ID>": {
+      "model": "registered-candidate",
+      "wire_model": "provider/upstream-model",
+      "reasoning_effort": null,
+      "reasoning_max_tokens": 128,
+      "steering_suffix": "operator-configured steering text"
+    }
+  }
+}
+```
+
+The session service is a separately managed process. `/experimental/arc/session`
+is also accepted for development services implementing this same contract.
+`owner_id` must be stable and distinct across installations sharing that service.
+It is an identity, not a credential. Package catalog and session-service action
+bindings must agree. Cloud `wire_model` must equal the registered candidate's
+upstream checkpoint ID; routing still selects the registered Lemonade model.
+
+Send normal `/v1/chat/completions` requests with `X-Client-Session-Id` and
+`X-Lemonade-Request-Id`. The desktop and interactive CLI already supply both.
+Keep session identity for a conversation and operation identity for a retry of
+the same attempt. A new request attempt uses a new operation identity. Caller
+constructed `arc_context` is rejected in session mode. One assistant choice is
+supported. Missing identity fails closed before any service or provider call.
+
+Lemonade posts the original native request, owner/operation identity,
+`metadata.session_id`, `request_format: openai_chat`, and configured
+`available_action_ids` to `/prepare`. The service owns projection, attribution,
+held-model scheduling, native controls and private append history. It returns
+`owner_id`, `package_sha256`, `action_id`, `transaction_id`, `session_token`,
+`episode_id_hash`, `context_epoch`, `source_request_format`, `request_format`,
+`request`, and the full policy `decision`. Lemonade validates the configured
+package, eligible action, numerical arm SHA256 and nonnegative integer session
+revision, native format and upstream destination. It dispatches
+the prepared request through existing cloud or llama.cpp transport with normal
+credentials and HTTP security checks. Later thinking normalization, tool-schema
+rewrites, legacy token aliases and automatic usage requests are skipped for
+that prepared request. The service must deliberately include any desired
+`stream_options.include_usage`; absent usage remains unknown.
+
+After the downstream HTTP transport accepts a successful terminal response,
+Lemonade posts `/commit` with owner/session token,
+`settlement: successful_2xx_terminal_sent`, and exact assistant messages. A
+buffered response retains its entire native assistant object. Standard streamed
+text, reasoning text and tool arguments are accumulated from delivered deltas.
+Unrecognized streamed assistant fields are forwarded unchanged, but settlement
+records `response_messages: null, response_attribution: unknown` rather than
+inventing opaque/signed history. Streams require both finish reason and `[DONE]`;
+partial streams, provider errors, failed loads and client disconnects abort.
+The stream observer is bounded to 16 MiB per response. Settlement occurs outside
+router locks. Requests within a session wait for the previous settlement
+acknowledgment; different sessions proceed independently. Failed settlement is
+logged, and the host blocks further prepares for that session. The service may
+have committed even when its acknowledgment was lost. Reconcile the receipt at
+the service before explicitly restarting the host to clear this in-memory block;
+do not change session identity to bypass an unresolved receipt.
+A session service must make repeated settlement idempotent and reject reuse of
+an operation identity with a different source request.
+
+Native Messages, Responses and completions are separate protocol paths and are
+not qualified by this Chat adapter. Session collections fail closed on those
+paths. Local llama.cpp prepared transport is implemented but numerical ARC
+encoder/head parity and real local-model composition remain separate checks.
+
+Run `LEMONADE_TEST_PORT=<isolated port> python test/server_arc_session.py` against
+a freshly built isolated `lemond`. The synthetic test asserts actual provider
+wire equality and buffered/stream terminal commit, invalid receipt refusal,
+provider failure, partial-stream and disconnected-client abort. It also delays
+a commit acknowledgment to verify immediate continuation ordering and independent
+session concurrency, rejects malformed numerical receipts, and blocks
+continuation after a failed settlement acknowledgment. It makes no paid provider
+calls.
+`ArcSessionTest` is part of `cpp-ci` and checks fragmented tool history, opaque
+history disposition and settlement ownership. These transport checks do not
+qualify an ARC checkpoint or the session service's own policy/ledger math.

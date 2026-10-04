@@ -1,6 +1,8 @@
 #include "lemon/server.h"
 #include "lemon/api_docs.h"
 #include "lemon/arc_router.h"
+#include "lemon/arc_session.h"
+#include "lemon/prepared_request.h"
 #include "lemon/audio_types.h"
 #include "lemon/auto_tune.h"
 #include "lemon/error_types.h"
@@ -95,6 +97,23 @@ static json call_arc_worker(const std::string& endpoint, const json& request) {
         utils::HttpSecurityPolicy::TrustedLoopback, WrappedServer::current_request_cancel_context());
     arc_require(response.status_code == 200, "ARC worker refused the decision request");
     return json::parse(response.body);
+}
+
+static json settle_arc_session(const std::string& endpoint, const json& request) {
+    try {
+        auto response = utils::HttpClient::post(endpoint, request.dump(),
+            {{"Content-Type", "application/json"}}, 10,
+            utils::HttpSecurityPolicy::TrustedLoopback);
+        arc_require(response.status_code == 200, "ARC session settlement failed");
+        auto result = json::parse(response.body);
+        const bool commit = endpoint.size() >= 7 && endpoint.compare(endpoint.size() - 7, 7, "/commit") == 0;
+        arc_require(result.value("state", "") == (commit ? "committed" : "aborted"),
+                    "ARC session settlement was not acknowledged");
+        return result;
+    } catch (...) {
+        LOG(ERROR, "ARC") << "Session settlement acknowledgment unavailable; outcome unknown" << std::endl;
+        throw;
+    }
 }
 
 namespace {
@@ -201,7 +220,8 @@ void set_route_decision_sse_content_provider(
     httplib::Response& res,
     const std::optional<RouterDispatchResult>& dispatch,
     std::string request_body,
-    StreamFn stream_fn) {
+    StreamFn stream_fn,
+    std::function<bool()> cancelled = {}) {
     res.set_header("Cache-Control", "no-cache");
     res.set_header("Connection", "keep-alive");
     res.set_header("X-Accel-Buffering", "no");
@@ -212,22 +232,42 @@ void set_route_decision_sse_content_provider(
     json route_decision_json = dispatch
         ? route_decision_to_json(dispatch->decision)
         : json(nullptr);
+    auto prepared = dispatch ? dispatch->prepared_session : nullptr;
+    auto observed = std::make_shared<ArcChatStream>();
+    auto terminal_delivered = std::make_shared<bool>(false);
     res.set_chunked_content_provider(
         "text/event-stream",
-        [request_body = std::move(request_body),
+        [prepared, observed, terminal_delivered, cancelled, request_body = std::move(request_body),
          route_decision_json = std::move(route_decision_json),
          stream_fn = std::move(stream_fn)](size_t offset, httplib::DataSink& sink) {
             if (offset > 0) {
                 return false;
             }
 
+            PreparedRequestScope prepared_scope(prepared ? &prepared->request() : nullptr,
+                [terminal_delivered]() { return *terminal_delivered; });
+            httplib::DataSink observed_sink;
+            observed_sink.write = [&sink, terminal_delivered, observed, prepared](const char* data, size_t size) {
+                if (prepared && !observed->accept(data, size)) return false;
+                const bool written = sink.write(data, size);
+                *terminal_delivered = *terminal_delivered || (written && prepared && observed->terminal());
+                return written;
+            };
+            observed_sink.done = [&sink]() { sink.done(); };
+            observed_sink.done_with_trailer = [&sink](const httplib::Headers& headers) { sink.done_with_trailer(headers); };
+            observed_sink.is_writable = [&sink, cancelled]() {
+                return (!cancelled || !cancelled()) && (!sink.is_writable || sink.is_writable());
+            };
             stream_with_route_decision(
-                sink,
+                observed_sink,
                 route_decision_json,
                 [&request_body, &stream_fn](httplib::DataSink& route_sink) {
                     stream_fn(request_body, route_sink);
                 });
-            return false;
+            return prepared ? observed->terminal() : false;
+        },
+        [prepared, observed, terminal_delivered](bool) {
+            if (prepared) prepared->finish(*terminal_delivered, observed->messages());
         });
 }
 
@@ -3679,7 +3719,8 @@ void Server::handle_collection_chat_completions(const nlohmann::json& request_js
 
 std::optional<RouterDispatchResult> Server::route_collection_request(
     const nlohmann::json& request_json,
-    const ModelInfo& collection_info) {
+    const ModelInfo& collection_info,
+    const httplib::Request* request) {
     // The policy is parsed once when the models cache is built (ModelManager),
     // so dispatch just reads it here. A missing policy means the collection
     // failed to parse at cache-build time; return nullopt so the caller leaves
@@ -3693,6 +3734,36 @@ std::optional<RouterDispatchResult> Server::route_collection_request(
     if (collection_info.route_policy->arc_router) {
         try {
             const auto& config = *collection_info.route_policy->arc_router;
+            if (collection_info.route_policy->arc_session) {
+                arc_require(request != nullptr, "ARC session collection supports native Chat only");
+                const auto& session = *collection_info.route_policy->arc_session;
+                ArcSessionIdentity identity{request->get_header_value("X-Client-Session-Id"),
+                                            request->get_header_value("X-Lemonade-Request-Id")};
+                const auto payload = arc_session_prepare_payload(config, session, identity, json::parse(request->body));
+                const auto gate_key = json::array({session.endpoint, session.owner_id, identity.session_id}).dump();
+                auto lease = std::make_shared<ArcSessionLease>(gate_key, request->is_connection_closed);
+                const auto receipt = call_arc_worker(session.endpoint + "/prepare", payload);
+                auto prepared = std::make_shared<ArcPreparedSession>(session, receipt, settle_arc_session, std::move(lease));
+                validate_arc_session_receipt(config, session, receipt, request_json);
+                const auto action = receipt.at("action_id").get<std::string>();
+                const auto selected = config.at("actions").at(action).at("model").get<std::string>();
+                const auto target = model_manager_->get_model_info(selected);
+                arc_require(target.recipe == "cloud" || target.recipe == "llamacpp",
+                            "ARC prepared Chat transport supports cloud and llamacpp recipes only");
+                if (target.recipe == "cloud") {
+                    arc_require(target.checkpoint() == receipt.at("request").at("model"),
+                                "ARC wire_model does not match provider model registration");
+                }
+                RouterDispatchResult result;
+                result.requested_model = collection_info.model_name;
+                result.selected_model = selected;
+                result.decision.route_to = selected;
+                result.decision.matched_rule = "arc_session";
+                result.decision.outputs["arc"] = receipt.at("decision");
+                result.prepared_session = std::move(prepared);
+                return result;
+            }
+
             const json arc_request = arc_request_from_chat(request_json);
             validate_arc_chat_bindings(config, arc_request);
             Decision decision = route_arc(config, arc_request, call_arc_worker);
@@ -3970,12 +4041,13 @@ void Server::handle_chat_completions(const httplib::Request& req, httplib::Respo
                         // The recipe is the trigger (no "auto", no /v1/route): run the
                         // routing engine and rewrite the model to the selected
                         // candidate, then fall through to normal completion handling.
-                        route_dispatch = route_collection_request(request_json, info);
+                        route_dispatch = route_collection_request(request_json, info, &req);
                         if (route_dispatch) {
                             route_dispatch->requested_model = requested_model;
                             LOG(INFO, "Server") << "Router collection '" << requested_model
                                                 << "' -> '" << route_dispatch->selected_model << "'" << std::endl;
-                            apply_arc_dispatch(request_json, route_dispatch->decision);
+                            if (route_dispatch->prepared_session) request_json = route_dispatch->prepared_session->request();
+                            else apply_arc_dispatch(request_json, route_dispatch->decision);
                             request_json["model"] = route_dispatch->selected_model;
                             request_json.erase("route_trace");
                         }
@@ -4053,7 +4125,7 @@ void Server::handle_chat_completions(const httplib::Request& req, httplib::Respo
 
         // OpenCode and other OpenAI-compatible clients may send thinking=false
         // instead of Lemonade's enable_thinking=false.
-        normalize_thinking_controls(request_json);
+        if (!route_dispatch || !route_dispatch->prepared_session) normalize_thinking_controls(request_json);
 
         if (is_streaming) {
             try {
@@ -4067,7 +4139,7 @@ void Server::handle_chat_completions(const httplib::Request& req, httplib::Respo
                     request_body,
                     [this](const std::string& body, httplib::DataSink& sink) {
                         router_->chat_completion_stream(body, sink);
-                    });
+                    }, req.is_connection_closed);
             } catch (const std::exception& e) {
                 LOG(ERROR, "Server") << "Streaming failed: " << e.what() << std::endl;
                 res.status = 500;
@@ -4077,6 +4149,8 @@ void Server::handle_chat_completions(const httplib::Request& req, httplib::Respo
             // Log the HTTP request
             LOG(INFO, "Server") << "POST /api/v1/chat/completions - 200 OK" << std::endl;
 
+            PreparedRequestScope prepared_scope(route_dispatch && route_dispatch->prepared_session
+                ? &route_dispatch->prepared_session->request() : nullptr);
             auto response = router_->chat_completion(request_json);
 
             if (response.contains("error")) {
@@ -4102,7 +4176,19 @@ void Server::handle_chat_completions(const httplib::Request& req, httplib::Respo
                 }
             }
 
-            res.set_content(response.dump(), "application/json");
+            if (route_dispatch && route_dispatch->prepared_session) {
+                auto prepared = route_dispatch->prepared_session;
+                auto body = std::make_shared<std::string>(response.dump());
+                const json assistant = arc_chat_assistant(response);
+                const bool terminal = !assistant.is_null();
+                res.set_content_provider(body->size(), "application/json",
+                    [body](size_t offset, size_t length, httplib::DataSink& sink) {
+                        return sink.write(body->data() + offset, length);
+                    },
+                    [prepared, assistant, terminal](bool success) {
+                        prepared->finish(success && terminal, assistant);
+                    });
+            } else res.set_content(response.dump(), "application/json");
 
             record_response_telemetry(response, request_json);
 

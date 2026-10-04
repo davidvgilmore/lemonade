@@ -40,10 +40,13 @@ namespace jobs {
 class JobManager;
 }
 
+class ArcPreparedSession;
+
 struct RouterDispatchResult {
     std::string requested_model;
     std::string selected_model;
     Decision decision;
+    std::shared_ptr<ArcPreparedSession> prepared_session;
 };
 
 class Server {
@@ -157,7 +160,8 @@ private:
     // not engage (no parsed policy), so callers leave the request untouched.
     std::optional<RouterDispatchResult> route_collection_request(
         const nlohmann::json& request_json,
-        const ModelInfo& collection_info);
+        const ModelInfo& collection_info,
+        const httplib::Request* request = nullptr);
     // If request_json addresses a collection.router model, rewrite its "model"
     // field in place to the engine-selected candidate and return the Decision.
     // No-op otherwise.
