@@ -1,3 +1,4 @@
+import { appendChatDelta, chatHistoryMessage, ChatWireMessage } from '../../utils/chatWireMessage';
 import { createChatRequestIdentity } from '../../utils/chatRequestIdentity';
 import React, { useState, useEffect, useRef, useMemo } from 'react';
 import MarkdownMessage from '../../MarkdownMessage';
@@ -500,9 +501,7 @@ const LLMChatPanel: React.FC<LLMChatPanelProps> = ({
 
   const buildChatRequestBody = (messageHistory: Message[]) => ({
     model: chatModelName,
-    // Strip UI-only fields (e.g. `thinking`) so strict providers like
-    // Fireworks don't 400 on unknown keys in the assistant turn.
-    messages: messageHistory.map(({ role, content }) => ({ role, content })),
+    messages: messageHistory.map(chatHistoryMessage),
     stream: true,
     ...buildChatRequestOverrides(appSettings),
   });
@@ -813,6 +812,7 @@ const LLMChatPanel: React.FC<LLMChatPanelProps> = ({
   };
 
   const handleStreamingResponse = async (messageHistory: Message[]): Promise<void> => {
+    const wireMessage: ChatWireMessage = { role: 'assistant', content: '' };
     let accumulatedContent = '';
     let accumulatedThinking = '';
     let receivedFirstChunk = false;
@@ -839,6 +839,7 @@ const LLMChatPanel: React.FC<LLMChatPanelProps> = ({
           role: 'assistant',
           content: displayContent,
           thinking: totalThinking || undefined,
+          wireMessage: JSON.parse(JSON.stringify(wireMessage)),
         };
         return newMessages;
       });
@@ -893,8 +894,9 @@ const LLMChatPanel: React.FC<LLMChatPanelProps> = ({
             try {
               const parsed = JSON.parse(data);
               const delta = parsed.choices?.[0]?.delta;
+              if (delta) appendChatDelta(wireMessage, delta);
               const content = delta?.content;
-              const thinkingContent = delta?.reasoning_content || delta?.thinking;
+              const thinkingContent = delta?.reasoning_content || delta?.reasoning || delta?.thinking;
 
               if (content) accumulatedContent += content;
               if (thinkingContent) accumulatedThinking += thinkingContent;

@@ -56,6 +56,7 @@ require.extensions['.ts'] = function loadTypeScript(module, filename) {
   module._compile(output, filename);
 };
 
+const { appendChatDelta, chatHistoryMessage } = require(path.join(appRoot, 'src', 'renderer', 'utils', 'chatWireMessage.ts'));
 const { createChatRequestIdentity } = require(path.join(appRoot, 'src', 'renderer', 'utils', 'chatRequestIdentity.ts'));
 
 const collectionUtils = require(
@@ -1509,6 +1510,17 @@ tests.push({
     assert.notEqual(a['X-Client-Session-Id'], c['X-Client-Session-Id']);
     const reset = createChatRequestIdentity(makeId)();
     assert.notEqual(a['X-Client-Session-Id'], reset['X-Client-Session-Id']);
+  },
+});
+tests.push({
+  name: 'streamed assistant reasoning and tool identity survive display projection and history replay',
+  run: () => {
+    const wire = { role: 'assistant', content: '' };
+    appendChatDelta(wire, { content: '<think>Plan</think>', reasoning: 'Think ', reasoning_details: [{ index: 0, type: 'reasoning.text', text: 'Think ', signature: 'sig-' }], tool_calls: [{ index: 0, id: 'call-1', type: 'function', function: { name: 'lookup', arguments: '{"q":' } }] });
+    appendChatDelta(wire, { content: 'Visible answer', reasoning: 'carefully.', reasoning_details: [{ index: 0, type: 'reasoning.text', text: 'carefully.', signature: 'end' }], tool_calls: [{ index: 0, function: { arguments: '"x"}' } }] });
+    const display = { role: 'assistant', content: 'Visible answer', thinking: 'UI-only', wireMessage: wire };
+    assert.deepEqual(chatHistoryMessage(display), { role: 'assistant', content: '<think>Plan</think>Visible answer', reasoning: 'Think carefully.', reasoning_details: [{ index: 0, type: 'reasoning.text', text: 'Think carefully.', signature: 'sig-end' }], tool_calls: [{ id: 'call-1', type: 'function', function: { name: 'lookup', arguments: '{"q":"x"}' } }] });
+    assert.deepEqual(chatHistoryMessage({ role: 'assistant', content: 'Legacy', thinking: 'UI-only' }), { role: 'assistant', content: 'Legacy' });
   },
 });
 module.exports = { tests };
