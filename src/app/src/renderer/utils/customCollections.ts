@@ -282,7 +282,7 @@ export function validateRouterDraftStructure(draft: RouterCollectionDraft): stri
     if (!draft.arcRouter) return 'Import an ARC setup file.';
     const arc = draft.arcRouter;
     if (!arc.package?.alias || !/^[a-f0-9]{64}$/.test(arc.package?.package_sha256 ?? '')) return 'ARC setup needs a pinned package.';
-    if (!/^http:\/\/(127\.0\.0\.1|localhost|\[::1\]):[0-9]+\/v1\/rayline\/arc\/policy\/decide$/.test(arc.endpoint)) return 'ARC runtime must use a local endpoint.';
+    if (!/^http:\/\/127\.0\.0\.1:[0-9]{1,5}\/v1\/rayline\/arc\/policy\/decide$/.test(arc.endpoint)) return 'ARC runtime must use a local endpoint.';
     if (!isRecord(arc.actions) || !Object.keys(arc.actions).length) return 'ARC setup needs model bindings.';
     for (const [id, action] of Object.entries(arc.actions)) {
       if (!/^[a-f0-9]{64}$/.test(id) || !isRecord(action) || !draft.candidates.includes(action.model)) return 'Each ARC action must bind to a selected candidate.';
