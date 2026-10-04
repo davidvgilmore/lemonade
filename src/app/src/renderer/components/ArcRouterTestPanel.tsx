@@ -40,7 +40,7 @@ const ArcRouterTestPanel: React.FC<Props> = ({ policy, unavailableReason }) => {
       setRequest(null); setFilename(''); setResult(null); setError(null);
       try {
         const value = JSON.parse(await file.text());
-        if (!value || Array.isArray(value) || value.schema !== 'rayline.arc.policy-decision-request.v1') throw new Error('Choose an ARC decision request exported by your runtime.');
+        if (!value || Array.isArray(value) || value.schema_version !== 'rayline.arc.policy-decision-request.v1') throw new Error('Choose an ARC decision request exported by your runtime.');
         setRequest(value); setFilename(file.name);
       } catch (failure) { setError(failure instanceof Error ? failure.message : 'Could not read conversation.'); }
     }} />

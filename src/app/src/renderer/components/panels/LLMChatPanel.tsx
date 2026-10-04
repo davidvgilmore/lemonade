@@ -1,3 +1,4 @@
+import { createChatRequestIdentity } from '../../utils/chatRequestIdentity';
 import React, { useState, useEffect, useRef, useMemo } from 'react';
 import MarkdownMessage from '../../MarkdownMessage';
 import AudioButton from '../../AudioButton';
@@ -171,6 +172,7 @@ const LLMChatPanel: React.FC<LLMChatPanelProps> = ({
   const isChatModelLoaded = currentLoadedModel === chatModelName ||
     (currentLoadedModel !== null && routerCandidates.includes(currentLoadedModel));
 
+  const [requestIdentity] = useState(() => createChatRequestIdentity());
   const [messages, setMessages] = useState<Message[]>([]);
   const [inputValue, setInputValue] = useState('');
   const [editingIndex, setEditingIndex] = useState<number | null>(null);
@@ -653,7 +655,7 @@ const LLMChatPanel: React.FC<LLMChatPanelProps> = ({
 
       const response = await serverFetch('/chat/completions', {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
+        headers: { 'Content-Type': 'application/json', ...requestIdentity() },
         body: JSON.stringify(requestBody),
         signal: abortControllerRef.current?.signal,
       });
@@ -855,7 +857,7 @@ const LLMChatPanel: React.FC<LLMChatPanelProps> = ({
 
     const response = await serverFetch('/chat/completions', {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
+      headers: { 'Content-Type': 'application/json', ...requestIdentity() },
       body: JSON.stringify(requestBody),
       signal: abortControllerRef.current!.signal,
     });

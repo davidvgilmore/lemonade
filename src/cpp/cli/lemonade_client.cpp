@@ -176,18 +176,19 @@ static void print_response_warnings(const json& value, const std::string& indent
 // Overloaded make_request with configurable timeouts (in milliseconds)
 std::string LemonadeClient::make_request(const std::string& path, const std::string& method,
                                           const std::string& body, const std::string& content_type,
-                                          time_t connection_timeout_ms, time_t read_timeout_ms) const {
+                                          time_t connection_timeout_ms, time_t read_timeout_ms,
+                                          const std::map<std::string, std::string>& headers) const {
     std::string normalized_host = normalize_host(host_);
     httplib::Client cli = make_client(normalized_host, port_, api_key_, is_ssl_, connection_timeout_ms, read_timeout_ms);
 
     httplib::Result res;
 
     if (method == "GET") {
-        res = cli.Get(path);
+        res = cli.Get(path, httplib::Headers(headers.begin(), headers.end()));
     } else if (method == "POST") {
-        res = cli.Post(path, body, content_type);
+        res = cli.Post(path, httplib::Headers(headers.begin(), headers.end()), body, content_type);
     } else if (method == "DELETE") {
-        res = cli.Delete(path);
+        res = cli.Delete(path, httplib::Headers(headers.begin(), headers.end()));
     } else {
         throw std::runtime_error("Unsupported HTTP method: " + method);
     }
@@ -203,12 +204,13 @@ std::string LemonadeClient::make_request(const std::string& path, const std::str
 // responses on Ctrl-C without waiting for the next chunk.
 static httplib::Result handle_sse_stream(httplib::Client& cli, const std::string& path, const std::string& body, const std::string& content_type,
                               std::function<void(const std::string& event_type, const std::string& event_data)> callback,
-                              std::function<bool()> should_abort = nullptr) {
+                              std::function<bool()> should_abort = nullptr,
+                              const std::map<std::string, std::string>& headers = {}) {
     std::string buffer;
     std::string raw_response_body;
     bool saw_sse_event = false;
 
-    auto res = cli.Post(path, httplib::Headers(), body, content_type,
+    auto res = cli.Post(path, httplib::Headers(headers.begin(), headers.end()), body, content_type,
         [&](const char* data, size_t len) {
             if (should_abort && should_abort()) {
                 return false;
@@ -264,12 +266,13 @@ bool LemonadeClient::make_request(const std::string& path, const std::string& me
                                    const std::string& body, const std::string& content_type,
                                    std::function<void(const std::string& event_type, const std::string& event_data)> callback,
                                    time_t connection_timeout_ms, time_t read_timeout_ms,
-                                   std::function<bool()> should_abort) const {
+                                   std::function<bool()> should_abort,
+                                   const std::map<std::string, std::string>& headers) const {
     std::string normalized_host = normalize_host(host_);
     httplib::Client cli = make_client(normalized_host, port_, api_key_, is_ssl_, connection_timeout_ms, read_timeout_ms);
 
     if (method == "POST") {
-        auto res = handle_sse_stream(cli, path, body, content_type, callback, should_abort);
+        auto res = handle_sse_stream(cli, path, body, content_type, callback, should_abort, headers);
         // If we deliberately aborted, suppress the "connection closed"-style
         // error that httplib reports — the caller asked for this.
         if (should_abort && should_abort()) {

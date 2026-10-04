@@ -56,6 +56,8 @@ require.extensions['.ts'] = function loadTypeScript(module, filename) {
   module._compile(output, filename);
 };
 
+const { createChatRequestIdentity } = require(path.join(appRoot, 'src', 'renderer', 'utils', 'chatRequestIdentity.ts'));
+
 const collectionUtils = require(
   path.join(appRoot, 'src', 'renderer', 'utils', 'customCollections.ts'),
 );
@@ -1492,6 +1494,21 @@ tests.push({
     assert.match(collectionUtils.validateRouterDraftStructure(changed), /selected candidate/);
     assert.throws(() => build(changed), /selected candidate/);
     assert.match(collectionUtils.validateRouterDraftStructure({ ...draft, arcRouter: { ...draft.arcRouter, endpoint: 'https://external.example/decide' } }), /local endpoint/);
+  },
+});
+tests.push({
+  name: 'chat identity scopes concurrent conversations and creates a new request ID per attempt',
+  run() {
+    let counter = 0;
+    const makeId = () => String(++counter);
+    const first = createChatRequestIdentity(makeId);
+    const second = createChatRequestIdentity(makeId);
+    const a = first(), b = first(), c = second();
+    assert.equal(a['X-Client-Session-Id'], b['X-Client-Session-Id']);
+    assert.notEqual(a['X-Lemonade-Request-Id'], b['X-Lemonade-Request-Id']);
+    assert.notEqual(a['X-Client-Session-Id'], c['X-Client-Session-Id']);
+    const reset = createChatRequestIdentity(makeId)();
+    assert.notEqual(a['X-Client-Session-Id'], reset['X-Client-Session-Id']);
   },
 });
 module.exports = { tests };

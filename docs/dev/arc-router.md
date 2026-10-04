@@ -155,3 +155,14 @@ supply the required ARC conversation context by itself. API clients must supply
 The local decision test supports those catalog controls without dispatching
 anything. Full ordinary-chat support requires the shared runtime's session and
 steering lifecycle integration and remains unfinished.
+
+Desktop chat and `lemonade chat` supply the existing `X-Client-Session-Id`
+header and a fresh `X-Lemonade-Request-Id` for each request attempt. The session
+survives turns, while New Chat and CLI history resets start a new session.
+Independent windows or REPL processes receive independent identities. These
+headers identify requests; they do not attest completion, supply model
+attribution, or commit routing state. The experimental session adapter remains
+outside the public API until its streaming and retry lifecycle is qualified.
+
+Run `python test/cli_chat_identity.py` after building the CLI to check both
+streamed and non-streamed requests against a synthetic local HTTP server.
