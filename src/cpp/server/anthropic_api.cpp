@@ -759,7 +759,8 @@ json anthropic::convert_openai_chat_to_anthropic(const json& openai_response,
                         continue;
                     }
 
-                    std::string tool_id = tool_call.value("id", generate_anthropic_message_id());
+                    std::string tool_id = tool_call.value("id", std::string());
+                    if (tool_id.empty()) throw std::invalid_argument("tool response missing call ID");
                     std::string tool_name;
                     if (tool_call.contains("function") && tool_call["function"].is_object()) {
                         tool_name = tool_call["function"].value("name", "");
@@ -808,12 +809,17 @@ json anthropic::convert_openai_chat_to_anthropic(const json& openai_response,
         }
     }
 
-    int input_tokens = 0;
-    int output_tokens = 0;
+    json usage = json::object();
     if (openai_response.contains("usage") && openai_response["usage"].is_object()) {
-        const auto& usage = openai_response["usage"];
-        input_tokens = usage.value("prompt_tokens", 0);
-        output_tokens = usage.value("completion_tokens", 0);
+        const auto& source = openai_response["usage"];
+        for (const auto& field : {std::pair{"prompt_tokens", "input_tokens"}, std::pair{"completion_tokens", "output_tokens"}}) {
+            if (source.contains(field.first) && source[field.first].is_number_integer() && source[field.first].get<int64_t>() >= 0) {
+                usage[field.second] = source[field.first];
+            }
+        }
+    }
+    if (!usage.contains("input_tokens") || !usage.contains("output_tokens")) {
+        add_warning(mutable_warnings, "Backend usage unavailable; missing token counts remain absent");
     }
 
     json anthropic_res = {
@@ -824,10 +830,7 @@ json anthropic::convert_openai_chat_to_anthropic(const json& openai_response,
         {"content", content_blocks},
         {"stop_reason", stop_reason},
         {"stop_sequence", nullptr},
-        {"usage", {
-            {"input_tokens", input_tokens},
-            {"output_tokens", output_tokens}
-        }}
+        {"usage", usage}
     };
 
     if (!mutable_warnings.empty()) {
@@ -847,7 +850,7 @@ void anthropic::stream_openai_sse_to_anthropic_sse(const std::string& openai_bod
     bool started = false, failed = false, finished = false;
     int next_index = 0, active_index = -1;
     std::string active_kind;
-    int input_tokens = 0, output_tokens = 0;
+    json usage = json::object();
     struct ToolBlock { int index; std::string id; std::string name; };
     std::map<int, ToolBlock> tools;
     auto emit = [&](const std::string& event, const json& data) {
@@ -899,13 +902,16 @@ void anthropic::stream_openai_sse_to_anthropic_sse(const std::string& openai_bod
                         {"id", chunk.value("id", generate_anthropic_message_id())}, {"type", "message"},
                         {"role", "assistant"}, {"model", model}, {"content", json::array()},
                         {"stop_reason", nullptr}, {"stop_sequence", nullptr},
-                        {"usage", {{"input_tokens", 0}, {"output_tokens", 0}}}
+                        {"usage", json::object()}
                     }}})) return false;
                     started = true;
                 }
                 if (chunk.contains("usage") && chunk["usage"].is_object()) {
-                    input_tokens = chunk["usage"].value("prompt_tokens", input_tokens);
-                    output_tokens = chunk["usage"].value("completion_tokens", output_tokens);
+                    for (const auto& field : {std::pair{"prompt_tokens", "input_tokens"}, std::pair{"completion_tokens", "output_tokens"}}) {
+                        if (chunk["usage"].contains(field.first) && chunk["usage"][field.first].is_number_integer() && chunk["usage"][field.first].get<int64_t>() >= 0) {
+                            usage[field.second] = chunk["usage"][field.first];
+                        }
+                    }
                 }
                 if (!chunk.contains("choices") || !chunk["choices"].is_array() || chunk["choices"].empty()) continue;
                 const auto& choice = chunk["choices"][0];
@@ -929,7 +935,9 @@ void anthropic::stream_openai_sse_to_anthropic_sse(const std::string& openai_bod
                                 const auto name = fn.value("name", std::string());
                                 if (name.empty()) throw std::invalid_argument("tool stream started without function name");
                                 if (!close_active()) return false;
-                                ToolBlock block{next_index++, tool.value("id", generate_anthropic_message_id()), name};
+                                const auto id = tool.value("id", std::string());
+                                if (id.empty()) throw std::invalid_argument("tool stream started without call ID");
+                                ToolBlock block{next_index++, id, name};
                                 it = tools.emplace(source_index, block).first;
                                 if (!emit("content_block_start", {{"type", "content_block_start"}, {"index", block.index}, {"content_block", {
                                     {"type", "tool_use"}, {"id", block.id}, {"name", block.name}, {"input", json::object()}
@@ -963,12 +971,18 @@ void anthropic::stream_openai_sse_to_anthropic_sse(const std::string& openai_bod
         }
         if (stop_reason == "end_turn" && !tools.empty()) stop_reason = "tool_use";
         json message_delta = {{"type", "message_delta"}, {"delta", {{"stop_reason", stop_reason}, {"stop_sequence", nullptr}}},
-                              {"usage", {{"input_tokens", input_tokens}, {"output_tokens", output_tokens}}}};
-        if (!warnings.empty()) message_delta["warnings"] = warnings;
+                              {"usage", usage}};
+        auto final_warnings = warnings;
+        if (!usage.contains("input_tokens") || !usage.contains("output_tokens")) {
+            add_warning(final_warnings, "Backend usage unavailable; missing token counts remain absent");
+        }
+        if (!final_warnings.empty()) message_delta["warnings"] = final_warnings;
         if (emit("message_delta", message_delta)) emit("message_stop", {{"type", "message_stop"}});
         client_sink.done();
     };
-    call_router(openai_body, adapter_sink);
+    auto request = json::parse(openai_body);
+    request["stream_options"]["include_usage"] = true;
+    call_router(request.dump(), adapter_sink);
 }
 
 void OllamaApi::handle_anthropic_messages(const httplib::Request& req, httplib::Response& res) {

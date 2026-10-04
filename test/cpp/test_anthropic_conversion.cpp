@@ -13,7 +13,8 @@ static std::vector<json> stream(const std::vector<json>& chunks, bool fragmented
     sink.write = [&](const char* data, size_t len) { wire.append(data, len); return true; };
     sink.done = [] {};
     codec::stream_openai_sse_to_anthropic_sse("{}", sink, "test-model", {},
-        [&](const std::string&, httplib::DataSink& adapter) {
+        [&](const std::string& request, httplib::DataSink& adapter) {
+            check(json::parse(request)["stream_options"]["include_usage"] == true, "final usage not requested");
             std::string input;
             for (const auto& chunk : chunks) input += "data: " + chunk.dump() + "\n\n";
             input += "data: [DONE]\n\n";
@@ -85,6 +86,16 @@ int main() {
         bool error = false;
         for (const auto& event : bad) { check(event["type"] != "message_stop", "failure became successful terminal"); error |= event["type"] == "error"; }
         check(error, "failure missing error event");
+    }
+    const auto no_usage = stream({chunk({{"content", "answer"}}), chunk(json::object(), "stop")});
+    for (const auto& event : no_usage) if (event["type"] == "message_delta") {
+        check(event["usage"].empty(), "missing usage invented");
+        check(event.contains("warnings"), "missing usage not diagnosed");
+    }
+    auto no_id = tool;
+    no_id.erase("id");
+    for (const auto& event : stream({chunk({{"tool_calls", {no_id}}}), chunk(json::object(), "tool_calls")})) {
+        check(event["type"] != "message_stop", "missing tool ID became successful turn");
     }
     std::cout << "Messages thinking/tool history and fragmented streaming verified\n";
 }
