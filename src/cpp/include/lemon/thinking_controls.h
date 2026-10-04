@@ -14,10 +14,16 @@
 #pragma once
 
 #include <nlohmann/json.hpp>
+#include <string>
 
 namespace lemon {
 
 using json = nlohmann::json;
+
+// Translate Messages thinking modes into backend request controls. Adaptive
+// enables reasoning with the backend's default effort, not Anthropic budgeting.
+// Returns false for unknown modes without changing the request.
+bool apply_anthropic_thinking_type(json& request_json, const std::string& type);
 
 // True if the request asks for thinking to be disabled, via Lemonade's
 // `enable_thinking: false` (takes precedence) or the OpenAI-compat

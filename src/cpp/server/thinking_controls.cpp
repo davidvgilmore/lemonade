@@ -37,6 +37,17 @@ bool apply_native_disable_thinking_controls(json& request_json) {
 
 } // namespace
 
+bool apply_anthropic_thinking_type(json& request_json, const std::string& type) {
+    if (type != "enabled" && type != "adaptive" && type != "disabled") {
+        return false;
+    }
+    request_json["chat_template_kwargs"]["enable_thinking"] = type != "disabled";
+    if (type == "disabled") {
+        request_json["reasoning_effort"] = "none";
+    }
+    return true;
+}
+
 bool should_disable_thinking(const json& request_json) {
     // enable_thinking takes precedence over thinking when both are present.
     if (request_json.contains("enable_thinking") && request_json["enable_thinking"].is_boolean()) {

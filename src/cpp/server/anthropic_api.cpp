@@ -4,6 +4,7 @@
 #include "lemon/cloud_provider_registry.h"
 #include "lemon/error_types.h"
 #include "lemon/ollama_api.h"
+#include "lemon/thinking_controls.h"
 #include "lemon/utils/http_client.h"
 #include "lemon/utils/session_utils.h"
 #include <iostream>
@@ -677,12 +678,10 @@ json OllamaApi::convert_anthropic_to_openai_chat(const json& anthropic_request, 
 
     if (anthropic_request.contains("thinking") && anthropic_request["thinking"].is_object()) {
         std::string thinking_type = anthropic_request["thinking"].value("type", "");
-        if (thinking_type == "enabled") {
-            openai_req["enable_thinking"] = true;
-        } else if (thinking_type == "disabled") {
-            openai_req["enable_thinking"] = false;
-        } else {
+        if (!apply_anthropic_thinking_type(openai_req, thinking_type)) {
             add_warning(warnings, "Ignored unsupported thinking.type: " + thinking_type);
+        } else if (thinking_type == "adaptive") {
+            add_warning(warnings, "Adaptive thinking enables backend reasoning at its default effort; Anthropic adaptive budgeting is not emulated");
         }
     }
 
