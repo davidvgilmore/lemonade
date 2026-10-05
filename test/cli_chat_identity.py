@@ -32,10 +32,21 @@ class ChatIdentityTest(unittest.TestCase):
                 body = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
                 if self.path.endswith("/chat/completions"):
                     receipts.append((dict(self.headers), body))
-                    response = {"choices": [{"message": {"role": "assistant", "content": "answer"}}]}
+                    response = {
+                        "choices": [
+                            {"message": {"role": "assistant", "content": "answer"}}
+                        ]
+                    }
                     if body["stream"]:
-                        chunk = {"choices": [{"delta": {"content": "answer"}, "finish_reason": None}]}
-                        self.reply("data: " + json.dumps(chunk) + "\n\ndata: [DONE]\n\n", "text/event-stream")
+                        chunk = {
+                            "choices": [
+                                {"delta": {"content": "answer"}, "finish_reason": None}
+                            ]
+                        }
+                        self.reply(
+                            "data: " + json.dumps(chunk) + "\n\ndata: [DONE]\n\n",
+                            "text/event-stream",
+                        )
                     else:
                         self.reply(json.dumps(response))
                 else:
@@ -44,12 +55,28 @@ class ChatIdentityTest(unittest.TestCase):
         server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
         thread = threading.Thread(target=server.serve_forever, daemon=True)
         thread.start()
-        binary = os.environ.get("LEMONADE_CLI", str(Path(__file__).resolve().parents[1] / "build" / "lemonade"))
+        binary = os.environ.get(
+            "LEMONADE_CLI",
+            str(Path(__file__).resolve().parents[1] / "build" / "lemonade"),
+        )
         try:
             for flags in ([], ["--no-stream"]):
-                subprocess.run([binary, "--port", str(server.server_port), "chat", "synthetic", *flags],
-                               input="one\ntwo\n/clear\nthree\n/system system\nfour\n/quit\n", text=True,
-                               stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=True, timeout=20)
+                subprocess.run(
+                    [
+                        binary,
+                        "--port",
+                        str(server.server_port),
+                        "chat",
+                        "synthetic",
+                        *flags,
+                    ],
+                    input="one\ntwo\n/clear\nthree\n/system system\nfour\n/quit\n",
+                    text=True,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    check=True,
+                    timeout=20,
+                )
             self.assertEqual(len(receipts), 8)
             sessions = [h["X-Client-Session-Id"] for h, _ in receipts]
             operations = [h["X-Lemonade-Request-Id"] for h, _ in receipts]
@@ -58,7 +85,10 @@ class ChatIdentityTest(unittest.TestCase):
                 self.assertEqual(sessions[start], sessions[start + 1])
                 self.assertNotEqual(sessions[start + 1], sessions[start + 2])
                 self.assertNotEqual(sessions[start + 2], sessions[start + 3])
-                self.assertEqual(receipts[start + 1][1]["messages"][1], {"role": "assistant", "content": "answer"})
+                self.assertEqual(
+                    receipts[start + 1][1]["messages"][1],
+                    {"role": "assistant", "content": "answer"},
+                )
                 self.assertEqual(len(receipts[start + 2][1]["messages"]), 1)
             self.assertTrue(set(sessions[:4]).isdisjoint(sessions[4:]))
         finally:
