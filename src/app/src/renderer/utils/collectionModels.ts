@@ -29,6 +29,8 @@ export const isModelEffectivelyLoaded = (
   modelsData: ModelsData,
   loadedModels: Set<string>,
 ): boolean => {
+  // Router selection has no resident backend; candidates load per request.
+  if (isRouterCollection(info)) return false;
   if (isCollectionModel(info)) {
     return isCollectionFullyLoaded(modelName, modelsData, loadedModels);
   }

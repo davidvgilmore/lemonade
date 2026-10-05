@@ -19,7 +19,8 @@ import ConnectedBackendRow from './components/ConnectedBackendRow';
 import MarketplacePanel, { MarketplaceCategory } from './MarketplacePanel';
 import { COLLECTION_ROUTER_MODEL_RECIPE, RECIPE_DISPLAY_NAMES } from './utils/recipeNames';
 import { EjectIcon, PinIcon } from './components/Icons';
-import { getCollectionComponents, isCollectionFullyDownloaded, isCollectionModel, isModelEffectivelyDownloaded, isModelEffectivelyLoaded } from './utils/collectionModels';
+import { prepareModelSelection } from './utils/modelSelection';
+import { getCollectionComponents, isCollectionFullyDownloaded, isCollectionModel, isRouterCollection, isModelEffectivelyDownloaded, isModelEffectivelyLoaded } from './utils/collectionModels';
 import { getCollectionDisplayName, isCollectionEditableAsCustom } from './utils/customCollections';
 import { mergeWithDefaultSettings } from './utils/appSettings';
 import { tauriReady } from './tauriShim';
@@ -1614,46 +1615,23 @@ const [searchQuery, setSearchQuery] = useState('');
         return;
       }
 
-      if (isCollectionModel(modelData)) {
-        const components = getCollectionComponents(modelData);
-        if (components.length === 0) {
-          showError(`Experience model "${modelName}" has no component models.`);
-          return;
-        }
-
-        setLoadingModels(prev => {
-          const next = new Set(prev);
-          next.add(modelName);
-          components.forEach((component) => next.add(component));
-          return next;
-        });
-        window.dispatchEvent(new CustomEvent('modelLoadStart', { detail: { modelId: modelName } }));
-
-        for (const component of components) {
-          if (!modelsData[component]) {
-            throw new Error(`Missing component model "${component}" for ${modelName}.`);
-          }
-          await ensureModelReady(component, modelsData, {
-            onModelLoading: () => {},
-            skipHealthCheck: false,
-          });
-        }
-
-        await fetchCurrentLoadedModel();
-        window.dispatchEvent(new CustomEvent('modelLoadEnd', { detail: { modelId: modelName } }));
-        window.dispatchEvent(new CustomEvent('modelsUpdated'));
-        return;
-      }
-
-      setLoadingModels(prev => new Set(prev).add(modelName));
+      const components = isCollectionModel(modelData) && !isRouterCollection(modelData)
+        ? getCollectionComponents(modelData) : [];
+      setLoadingModels(prev => new Set([...prev, modelName, ...components]));
       window.dispatchEvent(new CustomEvent('modelLoadStart', { detail: { modelId: modelName } }));
-
-      const loadBody = options ? recipeOptionsToApi(options) : undefined;
-
-      await ensureModelReady(modelName, modelsData, {
-        onModelLoading: () => {}, // already set loading above
-        skipHealthCheck: !!options, // Force re-load when options are provided (Load Options modal)
-        loadBody,
+      await prepareModelSelection(modelName, modelsData, {
+        selectRouter: async name => {
+          const response = await serverFetch('/load', {
+            method: 'POST', headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ model_name: name }),
+          });
+          if (!response.ok) throw new Error(`Failed to select router: ${response.statusText}`);
+        },
+        ensureReady: name => ensureModelReady(name, modelsData, {
+          onModelLoading: () => {},
+          skipHealthCheck: name === modelName && !!options,
+          loadBody: name === modelName && options ? recipeOptionsToApi(options) : undefined,
+        }),
       });
 
       await fetchCurrentLoadedModel();
@@ -2018,7 +1996,7 @@ const [searchQuery, setSearchQuery] = useState('');
             <button
               className="model-action-btn load-btn"
               onClick={(e) => { e.stopPropagation(); handleLoadModel(modelName); }}
-              title="Load model"
+              title={isRouterCollection(modelsData[modelName]) ? 'Select router' : 'Load model'}
             >
               <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
                 <polygon points="5 3 19 12 5 21" fill="currentColor" />

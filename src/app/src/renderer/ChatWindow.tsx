@@ -169,7 +169,7 @@ const ChatWindow: React.FC<ChatWindowProps> = ({ isVisible, width }) => {
       const customEvent = event as CustomEvent<{ modelId?: string }>;
       const loadedModelId = customEvent.detail?.modelId;
       if (loadedModelId) {
-        setCurrentLoadedModel(loadedModelId);
+        setCurrentLoadedModel(isRouterCollection(modelsDataRef.current[loadedModelId]) ? null : loadedModelId);
         setSelectedModel(loadedModelId);
       } else {
         fetchLoadedModel();

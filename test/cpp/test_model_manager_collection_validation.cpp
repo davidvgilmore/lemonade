@@ -475,6 +475,23 @@ static void test_register_preserves_routing(ModelManager& manager) {
           it != info.extras.end() && it->second == doc["routing"]);
 }
 
+static void test_cloud_readiness_without_local_artifacts(ModelManager& manager) {
+    manager.register_user_model("user.ReadyCloud", {{"recipe", "cloud"},
+        {"checkpoint", "vendor/model"}, {"cloud_provider", "custom-cloud"}, {"labels", {"chat"}}});
+    manager.register_user_model("user.MissingLocal", {{"recipe", "llamacpp"},
+        {"checkpoint", "missing/model:Q4_K_M"}, {"labels", {"chat"}}});
+    manager.register_user_model("user.CloudOnly", {{"recipe", "collection.omni"},
+        {"components", {"user.ReadyCloud"}}});
+    manager.register_user_model("user.MixedReady", {{"recipe", "collection.omni"},
+        {"components", {"user.ReadyCloud", "user.MissingLocal"}}});
+    check("explicit cloud alias needs no local artifacts", manager.get_model_info("user.ReadyCloud").downloaded);
+    check("missing local artifact remains not downloaded", !manager.get_model_info("user.MissingLocal").downloaded);
+    check("cloud-only collection is downloaded", manager.get_model_info("user.CloudOnly").downloaded);
+    check("mixed collection still requires local artifacts", !manager.get_model_info("user.MixedReady").downloaded);
+    ModelManager reloaded;
+    check("cloud readiness survives registry reload", reloaded.get_model_info("user.ReadyCloud").downloaded);
+}
+
 static void test_register_preserves_cloud_provider(ModelManager& manager) {
     json doc = {{"recipe", "cloud"}, {"checkpoint", "vendor/model"},
                 {"cloud_provider", "custom-cloud"}, {"labels", {"chat"}}};
@@ -505,6 +522,7 @@ int main() {
     test_filtered_classifier_builtin_prefixed_alias_resolves(manager);
     test_register_preserves_routing(manager);
     test_register_preserves_cloud_provider(manager);
+    test_cloud_readiness_without_local_artifacts(manager);
 
     fs::remove_all(temp);
 

@@ -436,6 +436,12 @@ retry. Numerical ARC parity, durable recovery, Responses ingress and real-provid
 cache behavior remain separate acceptance requirements. This setup is an
 experimental integration, not a claim that the whole deployment is launch-ready.
 
+Registered cloud models need no local download. For a ready router collection,
+use **Select router** to select the collection through the ordinary load endpoint.
+This does not load every candidate: routing selects a destination per request.
+The conversation keeps the router name selected without reporting a resident
+router backend. Omni collections retain their component loading behavior.
+
 Ordinary desktop and browser Chat on a router collection can use the read-only
 `lemonade_list_models` tool to answer questions about models registered on the
 connected server. It reads the existing authenticated model-list endpoint; it

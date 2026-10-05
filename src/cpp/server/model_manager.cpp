@@ -3332,7 +3332,8 @@ void ModelManager::build_cache() {
             continue;  // Handled in second pass after components are resolved
         }
         const auto* desc = backends::descriptor_for(info.recipe);
-        if (!(desc && desc->dynamic_models)) {
+        // Explicit cloud aliases have no discovered status to preserve.
+        if (info.recipe == "cloud" || !(desc && desc->dynamic_models)) {
             info.downloaded = backends::ops_for(info.recipe)->is_downloaded(info, status_ctx);
         }
 
