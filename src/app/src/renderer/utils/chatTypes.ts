@@ -24,6 +24,10 @@ export interface Message {
   role: 'user' | 'assistant';
   content: MessageContent;
   thinking?: string;
+  wireHistory?: Record<string, any>[];
+  wireExcluded?: boolean;
+  wireBlocked?: boolean;
+  wireMessage?: { role: 'assistant'; content: string; [key: string]: unknown };
 }
 
 // Wire protocol types for tool-calling agentic loop

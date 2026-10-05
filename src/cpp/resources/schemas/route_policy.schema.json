@@ -38,7 +38,7 @@
           "description": "Fail-open target; must be a member of candidates.",
           "type": "string"
         },
-        "router": { "$ref": "#/$defs/router_sugar" },
+        "router": { "oneOf": [{ "$ref": "#/$defs/router_sugar" }, { "$ref": "#/$defs/arc_router" }] },
         "classifiers": {
           "type": "array",
           "items": { "$ref": "#/$defs/classifier" }
@@ -54,6 +54,48 @@
           "then": { "not": { "anyOf": [{ "required": ["rules"] }, { "required": ["classifiers"] }] } } }
       ],
       "additionalProperties": false
+    },
+    "arc_router": {
+      "type": "object",
+      "required": ["type", "package", "actions"],
+      "allOf": [{
+        "if": { "required": ["session"] },
+        "then": { "properties": { "actions": { "additionalProperties": { "required": ["wire_model"] } } } },
+        "else": { "required": ["endpoint"], "properties": { "actions": { "additionalProperties": { "not": { "required": ["wire_model"] } } } } }
+      }],
+      "properties": {
+        "type": { "const": "arc" },
+        "endpoint": { "type": "string", "pattern": "^http://127\\.0\\.0\\.1:[0-9]{1,5}/v1/rayline/arc/policy/decide$" },
+        "session": {
+          "type": "object", "required": ["endpoint", "owner_id"],
+          "properties": {
+            "endpoint": { "type": "string", "pattern": "^http://127\\.0\\.0\\.1:[0-9]{1,5}/(experimental/arc/session|v1/rayline/arc/session)$" },
+            "owner_id": { "type": "string", "minLength": 1, "maxLength": 256 },
+            "codec_sha256": { "type": "string", "pattern": "^[0-9a-f]{64}$" }
+          }, "additionalProperties": false
+        },
+        "package": {
+          "type": "object", "required": ["alias", "package_sha256"],
+          "properties": {
+            "alias": { "type": "string", "minLength": 1 },
+            "package_sha256": { "type": "string", "pattern": "^[0-9a-f]{64}$" }
+          }, "additionalProperties": false
+        },
+        "actions": {
+          "type": "object", "minProperties": 1,
+          "propertyNames": { "pattern": "^[0-9a-f]{64}$" },
+          "additionalProperties": {
+            "type": "object", "required": ["model", "reasoning_effort", "reasoning_max_tokens", "steering_suffix"],
+            "properties": {
+              "model": { "type": "string", "minLength": 1 },
+              "wire_model": { "type": "string", "minLength": 1 },
+              "reasoning_effort": { "type": ["string", "null"] },
+              "reasoning_max_tokens": { "type": ["integer", "null"], "minimum": 0 },
+              "steering_suffix": { "type": "string" }
+            }, "additionalProperties": false
+          }
+        }
+      }, "additionalProperties": false
     },
     "router_sugar": {
       "description": "Zero-config L0(a) LLM-as-router. Desugars at load into one `llm` classifier (labels = candidates) + identity rules (label X -> route_to X). This desugaring is pure, deterministic engine logic and is frozen for v1: its expansion must stay behavior-equivalent so existing L0(a) policies keep routing identically across server versions.",

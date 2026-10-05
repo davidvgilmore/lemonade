@@ -24,6 +24,11 @@ const numericSettingsConfig: Array<{
   description: string;
 }> = [
   {
+    key: 'maxOutputTokens',
+    label: 'Maximum Output Tokens',
+    description: 'Limit generated tokens per response. Auto uses the server or provider default.',
+  },
+  {
     key: 'temperature',
     label: 'Temperature',
     description: 'Controls randomness in responses (0 = deterministic, 2 = very random)',
@@ -247,9 +252,9 @@ const SettingsPanel: React.FC<SettingsPanelProps> = ({ isVisible, searchQuery = 
       id: 'llm_chat_settings',
       label: 'LLM',
       keywords: [
-        'llm', 'chat', 'temperature', 'top k', 'top p', 'repeat penalty', 'thinking', 'collapse thinking'
+        'llm', 'chat', 'maximum output tokens', 'temperature', 'top k', 'top p', 'repeat penalty', 'thinking', 'collapse thinking'
       ],
-      settingCount: 6,
+      settingCount: 7,
     },
     {
       id: 'tts_settings',

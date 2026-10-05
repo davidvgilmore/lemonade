@@ -666,6 +666,15 @@ lemonade launch [AGENT] [--model MODEL_NAME] [options]
 | `--recipe-file FILE` | Remote recipe JSON filename used only if you choose recipe import at prompt | No |
 | `--agent-args ARGS` | Custom arguments to pass directly to the launched agent process | `""` |
 
+Claude-only options:
+
+| Option/Argument | Description | Required |
+|-----------------|-------------|----------|
+| `--fresh-profile ABSOLUTE_DIR` | Create a new client profile, keeping the existing user's Claude settings untouched | No |
+| `--context-tokens TOKENS` | Positive client context budget for this process; does not change server context | No |
+
+See [Claude Code profile and context setup](../integrations/claude-code.md#a-fresh-profile-and-an-explicit-context-budget).
+
 Codex-only option:
 
 | Option/Argument | Description | Required |

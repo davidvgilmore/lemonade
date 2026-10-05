@@ -1,4 +1,5 @@
 #include "lemon_cli/chat_repl.h"
+#include "lemon_cli/chat_request_identity.h"
 #include "lemon_cli/model_selection.h"
 
 #include <atomic>
@@ -495,6 +496,7 @@ TurnResult blocking_chat_turn(const TermUi& ui,
                               lemonade::LemonadeClient& client,
                               const std::string& model,
                               const json& messages,
+                              const ChatRequestIdentity& identity,
                               ReasoningMode reasoning,
                               std::string& assistant_out) {
     TurnResult result;
@@ -513,7 +515,7 @@ TurnResult blocking_chat_turn(const TermUi& ui,
         std::string body = client.make_request("/api/v1/chat/completions", "POST",
                                                request_body.dump(), "application/json",
                                                /*connection_timeout_ms=*/30000,
-                                               /*read_timeout_ms=*/600000);
+                                               /*read_timeout_ms=*/600000, identity.next());
         spinner.stop();
         json response = json::parse(body);
         if (response.contains("choices") && response["choices"].is_array() &&
@@ -574,6 +576,7 @@ TurnResult stream_chat_turn_capture(const TermUi& ui,
                                     lemonade::LemonadeClient& client,
                                     const std::string& model,
                                     const json& messages,
+                                    const ChatRequestIdentity& identity,
                                     ReasoningMode reasoning,
                                     std::string& assistant_out) {
     TurnResult result;
@@ -697,7 +700,7 @@ TurnResult stream_chat_turn_capture(const TermUi& ui,
                             callback,
                             /*connection_timeout_ms=*/30000,
                             /*read_timeout_ms=*/600000,
-                            /*should_abort=*/[]{ return g_interrupted.load(); });
+                            /*should_abort=*/[]{ return g_interrupted.load(); }, identity.next());
     } catch (const std::exception& e) {
         spinner.stop();
         if (!g_interrupted) {
@@ -928,6 +931,7 @@ int run_chat_repl(lemonade::LemonadeClient& client, const ChatOptions& options) 
         return 1;
     }
 
+    ChatRequestIdentity identity;
     json messages;
     rebuild_messages(messages, system_prompt);
 
@@ -969,10 +973,12 @@ int run_chat_repl(lemonade::LemonadeClient& client, const ChatOptions& options) 
             } else if (cmd == "/help") {
                 print_help(ui);
             } else if (cmd == "/clear") {
+                identity.reset();
                 rebuild_messages(messages, system_prompt);
                 print_info(ui, "history cleared");
             } else if (cmd == "/system") {
                 system_prompt = rest;
+                identity.reset();
                 rebuild_messages(messages, system_prompt);
                 print_info(ui, "system prompt updated; history cleared");
             } else if (cmd == "/model") {
@@ -982,6 +988,7 @@ int run_chat_repl(lemonade::LemonadeClient& client, const ChatOptions& options) 
                 }
                 if (ensure_model_loaded(ui, client, rest)) {
                     active_model = rest;
+                    identity.reset();
                     rebuild_messages(messages, system_prompt);
                     print_info(ui, "switched to " + active_model + "; history cleared");
                 }
@@ -1106,9 +1113,9 @@ int run_chat_repl(lemonade::LemonadeClient& client, const ChatOptions& options) 
 
         std::string assistant_text;
         TurnResult turn = stream
-            ? stream_chat_turn_capture(ui, client, active_model, messages,
+            ? stream_chat_turn_capture(ui, client, active_model, messages, identity,
                                        reasoning_mode, assistant_text)
-            : blocking_chat_turn(ui, client, active_model, messages,
+            : blocking_chat_turn(ui, client, active_model, messages, identity,
                                  reasoning_mode, assistant_text);
 
         if (turn.interrupted) {

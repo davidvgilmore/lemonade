@@ -1,5 +1,7 @@
 #include "lemon/routing_policy_parser.h"
 
+#include "lemon/arc_router.h"
+#include "lemon/arc_session.h"
 #include "lemon/model_types.h"
 
 #include <algorithm>
@@ -647,6 +649,27 @@ RoutePolicy parse_route_policy_collection(const json& collection_json,
     RoutePolicy policy;
     policy.candidates = parse_candidates(routing, declared, options);
     policy.default_model = parse_default_model(routing, policy.candidates, declared, options);
+
+    if (routing.contains("router") && routing.at("router").value("type", "") == "arc") {
+        if (routing.contains("rules") || routing.contains("classifiers")) {
+            throw std::invalid_argument("ARC router cannot be combined with rules or classifiers");
+        }
+        json config = routing.at("router");
+        validate_arc_router(config);
+        if (config.contains("session")) policy.arc_session = parse_arc_session(config.at("session"));
+        for (auto& [action, binding] : config.at("actions").items()) {
+            const std::string original = binding.at("model").get<std::string>();
+            const std::string resolved = resolve_component(original, options, "routing.router.actions.model");
+            require_declared(resolved, original, declared, options, "routing.router.actions.model");
+            if (!contains_string(policy.candidates, resolved)) {
+                throw std::invalid_argument("ARC action model must be a routing candidate");
+            }
+            binding["model"] = resolved;
+        }
+        policy.arc_router = std::move(config);
+        if (out_normalized_routing) *out_normalized_routing = routing;
+        return policy;
+    }
 
     // Desugar the L0a `routing.router` sugar into explicit classifiers + rules
     // before the normal parse path runs. Everything downstream sees the core

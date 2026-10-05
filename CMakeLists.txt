@@ -997,6 +997,7 @@ include_directories(
 # ============================================================
 set(SOURCES_CORE
     src/cpp/server/server.cpp
+    src/cpp/server/arc_session.cpp
     src/cpp/server/collection_orchestrator.cpp
     src/cpp/server/jobs/job_ops.cpp
     src/cpp/server/jobs/job_manager.cpp
@@ -1042,6 +1043,7 @@ set(SOURCES_CORE
     src/cpp/server/backend_manager.cpp
     src/cpp/server/ollama_api.cpp
     src/cpp/server/anthropic_api.cpp
+    src/cpp/server/anthropic_upstream.cpp
     src/cpp/server/mcp_server.cpp
     src/cpp/server/streaming_audio_buffer.cpp
     src/cpp/server/vad.cpp
@@ -2229,25 +2231,13 @@ add_custom_target(embeddable
     # Copy LICENSE
     COMMAND ${CMAKE_COMMAND} -E copy "${CMAKE_CURRENT_SOURCE_DIR}/LICENSE" "${EMBEDDABLE_STAGING_DIR}/"
 
-    # Copy resource files
-    COMMAND ${CMAKE_COMMAND} -E copy
-        "$<TARGET_FILE_DIR:lemond>/resources/server_models.json"
-        "${EMBEDDABLE_STAGING_DIR}/resources/"
-    COMMAND ${CMAKE_COMMAND} -E copy
-        "$<TARGET_FILE_DIR:lemond>/resources/backend_versions.json"
-        "${EMBEDDABLE_STAGING_DIR}/resources/"
-    COMMAND ${CMAKE_COMMAND} -E copy
-        "$<TARGET_FILE_DIR:lemond>/resources/vllm_model_config.json"
-        "${EMBEDDABLE_STAGING_DIR}/resources/"
-    COMMAND ${CMAKE_COMMAND} -E copy
-        "$<TARGET_FILE_DIR:lemond>/resources/defaults.json"
-        "${EMBEDDABLE_STAGING_DIR}/resources/"
-    COMMAND ${CMAKE_COMMAND} -E copy
-        "$<TARGET_FILE_DIR:lemond>/resources/bench_scenarios.json"
-        "${EMBEDDABLE_STAGING_DIR}/resources/"
-    COMMAND ${CMAKE_COMMAND} -E copy
-        "$<TARGET_FILE_DIR:lemond>/resources/toolDefinitions.json"
-        "${EMBEDDABLE_STAGING_DIR}/resources/"
+    # Package the same staged resource tree used by the server, rather than a
+    # second hand-maintained list that can omit new runtime configuration.
+    COMMAND ${CMAKE_COMMAND}
+        "-DRESOURCE_SOURCE=${CMAKE_BINARY_DIR}/resources"
+        "-DRESOURCE_DESTINATION=${EMBEDDABLE_STAGING_DIR}/resources"
+        "-DINCLUDE_WEB_APP=${BUILD_WEB_APP}"
+        -P "${CMAKE_CURRENT_SOURCE_DIR}/cmake/StageEmbeddableResources.cmake"
 
     # Create archive
     COMMAND ${CMAKE_COMMAND} -E chdir "${CMAKE_BINARY_DIR}" ${EMBEDDABLE_TAR_CMD}
@@ -2256,6 +2246,18 @@ add_custom_target(embeddable
     COMMENT "Assembling embeddable archive: ${EMBEDDABLE_ARCHIVE_NAME}"
     VERBATIM
 )
+
+if(BUILD_WEB_APP AND TARGET web-app)
+    add_dependencies(embeddable web-app)
+endif()
+
+if(BUILD_TESTING)
+    add_cpp_ci_test(EmbeddableResourcesTest CI OFF
+        COMMAND ${CMAKE_COMMAND}
+            "-DSTAGING_SCRIPT=${CMAKE_CURRENT_SOURCE_DIR}/cmake/StageEmbeddableResources.cmake"
+            "-DTEST_ROOT=${CMAKE_CURRENT_BINARY_DIR}/test-embeddable-resources"
+            -P "${CMAKE_CURRENT_SOURCE_DIR}/test/cmake/test_embeddable_resources.cmake")
+endif()
 
 message(STATUS "Embeddable archive target available: cmake --build . --target embeddable")
 message(STATUS "  Archive: ${EMBEDDABLE_ARCHIVE_NAME}")
@@ -3162,6 +3164,13 @@ if(BUILD_TESTING AND EXISTS "${_CONFIG_DEFAULT_SOURCE_TEST_SRC}")
     add_cpp_ci_test(ConfigDefaultSourceTest CI ON COMMAND test_config_default_source)
 endif()
 
+set(_AGENT_LAUNCHER_TEST_SRC "${CMAKE_CURRENT_SOURCE_DIR}/test/cpp/test_agent_launcher.cpp")
+if(BUILD_TESTING AND EXISTS "${_AGENT_LAUNCHER_TEST_SRC}")
+    add_executable(test_agent_launcher test/cpp/test_agent_launcher.cpp src/cpp/cli/agent_launcher.cpp)
+    target_link_libraries(test_agent_launcher PRIVATE lemonade-server-core)
+    add_cpp_ci_test(AgentLauncherTest CI ON COMMAND test_agent_launcher)
+endif()
+
 set(_CLI_RUNTIME_OVERRIDE_TEST_SRC "${CMAKE_CURRENT_SOURCE_DIR}/test/cpp/test_cli_runtime_override.cpp")
 if(BUILD_TESTING AND EXISTS "${_CLI_RUNTIME_OVERRIDE_TEST_SRC}")
     add_executable(test_cli_runtime_override test/cpp/test_cli_runtime_override.cpp)
@@ -3342,6 +3351,18 @@ if(BUILD_TESTING AND EXISTS "${_CLOUD_PROVIDER_REGISTRY_CONFIG_TEST_SRC}")
     add_cpp_ci_test(CloudProviderRegistryConfigTest CI ON COMMAND test_cloud_provider_registry_config)
 endif()
 
+if(BUILD_TESTING AND EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test/cpp/test_anthropic_conversion.cpp")
+    add_executable(test_anthropic_conversion test/cpp/test_anthropic_conversion.cpp)
+    target_link_libraries(test_anthropic_conversion PRIVATE lemonade-server-core)
+    add_cpp_ci_test(AnthropicConversionTest CI ON COMMAND test_anthropic_conversion)
+endif()
+
+if(BUILD_TESTING AND EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test/cpp/test_anthropic_thinking.cpp")
+    add_executable(test_anthropic_thinking test/cpp/test_anthropic_thinking.cpp)
+    target_link_libraries(test_anthropic_thinking PRIVATE lemonade-server-core)
+    add_cpp_ci_test(AnthropicThinkingTest CI ON COMMAND test_anthropic_thinking)
+endif()
+
 set(_ANTHROPIC_ERROR_TEST_SRC "${CMAKE_CURRENT_SOURCE_DIR}/test/cpp/test_anthropic_error.cpp")
 if(BUILD_TESTING AND EXISTS "${_ANTHROPIC_ERROR_TEST_SRC}")
     add_executable(test_anthropic_error test/cpp/test_anthropic_error.cpp)
@@ -3454,4 +3475,23 @@ if(BUILD_TESTING AND EXISTS "${_MODEL_SYNC_TEST_SRC}")
 
     include(CTest)
     add_cpp_ci_test(ModelSyncAndAutoUpdateTest CI ON COMMAND test_model_sync_and_auto_update)
+endif()
+
+if(BUILD_TESTING)
+    add_executable(test_arc_router
+        test/cpp/test_arc_router.cpp
+        src/cpp/server/routing_policy.cpp
+        src/cpp/server/routing_policy_parser.cpp)
+    target_include_directories(test_arc_router PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/src/cpp/include
+        ${CMAKE_CURRENT_BINARY_DIR}/include)
+    target_link_libraries(test_arc_router PRIVATE nlohmann_json::nlohmann_json)
+    add_cpp_ci_test(ArcRouterTest CI ON COMMAND test_arc_router)
+endif()
+
+if(BUILD_TESTING AND EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test/cpp/test_arc_session.cpp")
+    add_executable(test_arc_session test/cpp/test_arc_session.cpp)
+    target_include_directories(test_arc_session PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/src/cpp/include")
+    target_link_libraries(test_arc_session PRIVATE nlohmann_json::nlohmann_json)
+    add_cpp_ci_test(ArcSessionTest CI ON COMMAND test_arc_session)
 endif()

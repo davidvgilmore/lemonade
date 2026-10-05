@@ -283,8 +283,9 @@ Instead of authoring rules, you can hand the decision to a small LLM. Provide a
 
 The router `model` must be one of `components`. At request time the engine asks it
 to pick a candidate, and that desugars into the same first-match engine and
-`Decision`/trace as the rule form. `routing.router.type` must be `"llm"`, and the
-block is **mutually exclusive** with `routing.rules` and `routing.classifiers`.
+`Decision`/trace as the rule form. This form uses `routing.router.type: "llm"`; an experimental
+[`"arc"` adapter](arc-router.md) calls a local structured policy worker instead.
+The block is **mutually exclusive** with `routing.rules` and `routing.classifiers`.
 
 Unlike a `type: "llm"` classifier (which never receives `has_tools`/
 `has_images`, see above), the router always does: it's the sole decision

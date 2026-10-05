@@ -178,6 +178,8 @@ struct CliConfig {
     bool yes = false;
     int scan_duration = 30;
     bool json_output = false;
+    std::string claude_fresh_profile;
+    int claude_context_tokens = 0;
     bool codex_use_user_config = false;
     std::string codex_model_provider = "lemonade";
     std::string agent_args;
@@ -755,6 +757,15 @@ static int handle_launch_command(lemonade::LemonadeClient& client, CliConfig& co
         return 1;
     }
 
+    lemon_tray::AgentLaunchOptions launch_options;
+    launch_options.claude_fresh_profile = config.claude_fresh_profile;
+    launch_options.claude_context_tokens = config.claude_context_tokens;
+    std::string config_error;
+    if (config.agent == "claude" && !lemon_tray::validate_claude_launch_options(launch_options, config_error)) {
+        std::cerr << config_error << std::endl;
+        return 1;
+    }
+
     const bool model_was_missing = config.model.empty();
     if (!lemon_cli::resolve_model_if_missing(client, config.model, "launch", true, config.agent)) {
         return 1;
@@ -771,8 +782,6 @@ static int handle_launch_command(lemonade::LemonadeClient& client, CliConfig& co
     }
 
     lemon_tray::AgentConfig agent_config;
-    lemon_tray::AgentLaunchOptions launch_options;
-    std::string config_error;
 
     launch_options.codex_use_user_config = config.codex_use_user_config;
     launch_options.codex_model_provider = config.codex_model_provider;
@@ -803,6 +812,11 @@ static int handle_launch_command(lemonade::LemonadeClient& client, CliConfig& co
         if (!agent_config.install_instructions.empty()) {
             LOG(ERROR, "AgentBuilder") << agent_config.install_instructions << std::endl;
         }
+        return 1;
+    }
+
+    if (config.agent == "claude" && !lemon_tray::prepare_claude_profile(launch_options, config_error)) {
+        std::cerr << config_error << std::endl;
         return 1;
     }
 
@@ -1515,6 +1529,15 @@ int main(int argc, char* argv[]) {
                 ->group("Agents");
         agent_cmd->callback([&config, agent_name]() { config.agent = agent_name; });
         add_common_launch_options(*agent_cmd);
+
+        if (agent_name == "claude") {
+            agent_cmd->add_option("--fresh-profile", config.claude_fresh_profile,
+                "Create a new private Claude profile directory; leave existing user settings unchanged")
+                ->type_name("ABSOLUTE_DIR");
+            agent_cmd->add_option("--context-tokens", config.claude_context_tokens,
+                "Explicit Claude client context budget for this process; no server context change")
+                ->check(CLI::PositiveNumber)->type_name("TOKENS");
+        }
 
         if (agent_name == "codex") {
             codex_provider_opt = agent_cmd->add_option("--provider,-p", config.codex_model_provider,

@@ -1,9 +1,15 @@
+#include "lemon/arc_chat_frames.h"
+#include "lemon/arc_messages.h"
+#include "lemon/prepared_request.h"
 #include "lemon/anthropic_error.h"
+#include "lemon/anthropic_conversion.h"
 #include "lemon/anthropic_relay_headers.h"
+#include "lemon/anthropic_upstream.h"
 #include "lemon/backends/cloud/cloud_server.h"
 #include "lemon/cloud_provider_registry.h"
 #include "lemon/error_types.h"
 #include "lemon/ollama_api.h"
+#include "lemon/thinking_controls.h"
 #include "lemon/utils/http_client.h"
 #include "lemon/utils/session_utils.h"
 #include <iostream>
@@ -21,10 +27,112 @@ namespace lemon {
 
 namespace {
 
+static void forward_arc_chat(Router* router, json routing_request,
+                             const std::shared_ptr<ArcPreparedSession>& prepared,
+                             httplib::Response& res, std::function<bool()> cancelled) {
+    if (!prepared->request().value("stream", false)) {
+        PreparedRequestScope scope(&prepared->request());
+        utils::RequestCancelToken cancellation;
+        cancellation.should_cancel = cancelled;
+        WrappedServer::RequestCancelScope cancel_scope(cancellation);
+        const auto response = router->chat_completion(routing_request);
+        arc_require(!arc_chat_assistant(response).is_null(), "ARC Chat provider did not return terminal success");
+        const auto translated = prepared->transform("response", {{"body", response}}, cancelled).at("body");
+        const auto messages = arc_messages_assistant(translated);
+        arc_require(!messages.is_null(), "ARC codec did not return a terminal Messages response");
+        auto body = std::make_shared<std::string>(translated.dump());
+        res.set_content_provider(body->size(), "application/json",
+            [body](size_t offset, size_t length, httplib::DataSink& sink) {
+                return sink.write(body->data() + offset, length);
+            }, [prepared, messages](bool success) { prepared->finish(success, messages); });
+        return;
+    }
+    prepared->transform("stream_start", json::object(), cancelled);
+    auto native = std::make_shared<ArcMessagesStream>();
+    auto accepted = std::make_shared<bool>(false);
+    res.set_header("Cache-Control", "no-cache");
+    res.set_header("X-Accel-Buffering", "no");
+    res.set_chunked_content_provider("text/event-stream",
+        [router, routing_request, prepared, cancelled, native, accepted](size_t offset, httplib::DataSink& sink) {
+            if (offset > 0) return false;
+            try {
+                ArcChatFrames provider;
+                uint64_t sequence = 0;
+                std::vector<std::string> held;
+                const auto stopped = [&]() {
+                    return (cancelled && cancelled()) || (sink.is_writable && !sink.is_writable());
+                };
+                auto deliver = [&](const json& result, bool terminal) {
+                    for (const auto& item : result.at("frames")) held.push_back(item.get<std::string>());
+                    for (auto it = held.begin(); it != held.end();) {
+                        // A codec may produce its terminal before the provider's [DONE].
+                        // Retain that frame until the provider protocol is complete.
+                        auto probe = *native;
+                        if (!probe.accept(it->data(), it->size())) return false;
+                        if (probe.terminal() && !terminal) break;
+                        if (stopped() || !sink.write(it->data(), it->size())) return false;
+                        *native = std::move(probe);
+                        *accepted = native->terminal() && terminal;
+                        it = held.erase(it);
+                    }
+                    return true;
+                };
+                PreparedRequestScope scope(&prepared->request(), [accepted]() { return *accepted; });
+                httplib::DataSink bridge;
+                bridge.is_writable = [&]() { return !stopped(); };
+                bridge.done = []() {};
+                bridge.done_with_trailer = [](const httplib::Headers&) {};
+                bridge.write = [&](const char* data, size_t size) {
+                    return provider.accept(data, size, [&](const std::string& frame, bool terminal) {
+                        auto result = prepared->transform("stream_push", {{"sequence", sequence++}, {"frame", frame}}, stopped);
+                        if (!deliver(result, terminal)) return false;
+                        if (terminal) {
+                            result = prepared->transform("stream_finish", {{"sequence", sequence++}}, stopped);
+                            if (!deliver(result, true)) return false;
+                            arc_require(*accepted, "ARC codec did not produce a terminal Messages event");
+                        }
+                        return true;
+                    });
+                };
+                router->chat_completion_stream(routing_request.dump(), bridge);
+                if (*accepted) sink.done();
+            } catch (const std::exception&) {
+                // Releaser aborts a failed translation without inventing a terminal.
+            }
+            return *accepted;
+        }, [prepared, native, accepted](bool) { prepared->finish(*accepted, native->messages()); });
+}
+
 static void add_warning(std::vector<std::string>& warnings, const std::string& warning) {
     if (std::find(warnings.begin(), warnings.end(), warning) == warnings.end()) {
         warnings.push_back(warning);
     }
+}
+
+// Chat prompt totals include cache hits and writes; Messages input_tokens do not.
+// A missing cache partition stays unknown instead of becoming a zero count.
+static json anthropic_usage_from_chat(const json& source, std::vector<std::string>& warnings) {
+    json result = json::object();
+    auto count = [](const json& object, const char* key) -> std::optional<int64_t> {
+        if (!object.is_object() || !object.contains(key) || !object[key].is_number_integer()) return std::nullopt;
+        const auto value = object[key].get<int64_t>();
+        return value >= 0 ? std::optional<int64_t>(value) : std::nullopt;
+    };
+    const auto total = count(source, "prompt_tokens");
+    const auto output = count(source, "completion_tokens");
+    const auto details = source.is_object() ? source.value("prompt_tokens_details", json::object()) : json::object();
+    const auto read = count(details, "cached_tokens");
+    const auto write = count(details, "cache_write_tokens");
+    if (output) result["output_tokens"] = *output;
+    if (read) result["cache_read_input_tokens"] = *read;
+    if (write) result["cache_creation_input_tokens"] = *write;
+    if (total && read && write && *read <= *total && *write <= *total - *read) {
+        result["input_tokens"] = *total - *read - *write;
+    } else {
+        add_warning(warnings, "Backend cache breakdown unavailable or inconsistent; uncached input_tokens remains absent");
+    }
+    if (!output) add_warning(warnings, "Backend output token count unavailable; output_tokens remains absent");
+    return result;
 }
 
 static std::string join_strings(const std::vector<std::string>& parts, const char* sep = "\n") {
@@ -189,24 +297,6 @@ static void set_anthropic_residency_conflict_response(
 
 // Everything needed to relay one /v1/messages request to a provider that
 // speaks the Anthropic Messages wire format natively.
-struct AnthropicUpstream {
-    std::string url;
-    std::map<std::string, std::string> headers;
-    utils::HttpSecurityPolicy policy = utils::HttpSecurityPolicy::ExternalHttpsOnly;
-    std::string body;
-};
-
-// `claimed` separates "this model isn't relayed, fall through to conversion"
-// from "it is relayed but the provider is unusable" — the latter must report
-// its own error instead of failing further down as a misleading local-model
-// load failure.
-struct AnthropicUpstreamMatch {
-    bool claimed = false;
-    std::optional<AnthropicUpstream> upstream;
-    int error_status = 0;
-    std::string error_message;
-};
-
 static void set_anthropic_error_response(httplib::Response& res, int status,
                                          const std::string& message) {
     res.status = status;
@@ -215,188 +305,6 @@ static void set_anthropic_error_response(httplib::Response& res, int status,
         "application/json");
 }
 
-using anthropic::is_forwardable_request_header;
-using anthropic::is_forwardable_response_header;
-
-static AnthropicUpstreamMatch resolve_anthropic_upstream(ModelManager* model_manager,
-                                                         const std::string& model,
-                                                         const json& request_json,
-                                                         const httplib::Request& req) {
-    AnthropicUpstreamMatch match;
-    if (model_manager == nullptr) return match;
-    CloudProviderRegistry* registry = model_manager->cloud_registry();
-    if (registry == nullptr) return match;
-
-    ModelInfo info;
-    try {
-        if (!model_manager->model_exists(model)) return match;
-        info = model_manager->get_model_info(model);
-    } catch (const std::exception&) {
-        return match;
-    }
-    if (info.recipe != "cloud" || info.cloud_provider.empty()) return match;
-    if (registry->wire_format_for(info.cloud_provider) != "anthropic") return match;
-
-    match.claimed = true;
-    auto fail = [&match](int status, std::string message) {
-        match.error_status = status;
-        match.error_message = std::move(message);
-        return match;
-    };
-
-    const std::string base_url = registry->base_url_for(info.cloud_provider);
-    if (base_url.empty()) {
-        return fail(500, "provider '" + info.cloud_provider +
-                         "' has no base URL configured");
-    }
-    const std::string api_key = registry->resolve_key(info.cloud_provider);
-    if (api_key.empty()) {
-        return fail(401, "no API key for provider '" + info.cloud_provider + "'; set " +
-                         CloudProviderRegistry::env_var_name(info.cloud_provider) +
-                         " or POST /v1/cloud/auth");
-    }
-    const bool allow_insecure_http =
-        registry->allow_insecure_http_for(info.cloud_provider);
-    if (CloudProviderRegistry::is_http_base_url(base_url) && !allow_insecure_http) {
-        return fail(400, "provider '" + info.cloud_provider +
-                         "' uses an http:// base URL; re-install it with "
-                         "--allow-insecure-http to send the API key in plaintext");
-    }
-
-    // CloudServer::load() rejects this for the OpenAI-shaped endpoints; without
-    // the same check here a hand-authored registry entry would relay an empty
-    // model id and surface an opaque provider 400 instead.
-    if (info.checkpoint().empty()) {
-        return fail(500, "cloud model '" + model + "' is missing the 'checkpoint' "
-                         "field (provider's upstream model id)");
-    }
-
-    // The body passes through byte-for-byte apart from "model", which must name
-    // the provider's own id rather than lemonade's "<provider>.<id>" public one.
-    json forwarded = request_json;
-    forwarded["model"] = info.checkpoint();
-
-    const auto auth_header = registry->auth_header_for(info.cloud_provider);
-    AnthropicUpstream upstream;
-    upstream.url = backends::CloudServer::upstream_url(base_url, "/messages");
-    // The Anthropic API reads `beta` from the query string, so it has to be
-    // reattached to the upstream URL rather than folded into a header.
-    if (req.has_param("beta") && req.get_param_value("beta") == "true") {
-        upstream.url += "?beta=true";
-    }
-    upstream.headers = backends::CloudServer::upstream_headers(auth_header, api_key,
-                                                               "anthropic");
-    upstream.headers["Content-Type"] = "application/json";
-    // The first client value replaces whatever default upstream_headers() set;
-    // a repeat of the same name is joined, since a client may send
-    // anthropic-beta as several headers rather than one comma-separated value.
-    std::set<std::string> from_client;
-    for (const auto& [name, value] : req.headers) {
-        std::string lower = name;
-        for (auto& c : lower) c = std::tolower(static_cast<unsigned char>(c));
-        if (!is_forwardable_request_header(lower)) continue;
-        if (from_client.insert(lower).second) {
-            upstream.headers[lower] = value;
-        } else {
-            upstream.headers[lower] += "," + value;
-        }
-    }
-    session::apply_forwardable_session(upstream.headers);
-    upstream.policy = backends::CloudServer::discovery_policy(base_url, allow_insecure_http);
-    upstream.body = forwarded.dump();
-    match.upstream = std::move(upstream);
-    return match;
-}
-
-static void relay_response_headers(const std::map<std::string, std::string>& upstream,
-                                   httplib::Response& res) {
-    for (const auto& [name, value] : upstream) {
-        if (is_forwardable_response_header(name)) {
-            res.set_header(name, value);
-        }
-    }
-}
-
-static void forward_anthropic_upstream(AnthropicUpstream upstream,
-                                       bool stream,
-                                       const std::string& model,
-                                       httplib::Response& res) {
-    if (!stream) {
-        try {
-            auto response = utils::HttpClient::post(
-                upstream.url, upstream.body, upstream.headers, 0, upstream.policy);
-            res.status = response.status_code;
-            relay_response_headers(response.headers, res);
-            res.set_content(response.body, "application/json");
-        } catch (const std::exception& e) {
-            set_anthropic_error_response(
-                res, 502, "cloud request for '" + model + "' failed: " + e.what());
-        }
-        return;
-    }
-
-    res.set_header("Cache-Control", "no-cache");
-    res.set_header("Connection", "keep-alive");
-    res.set_header("X-Accel-Buffering", "no");
-    // Everything below runs inside the content provider, after the status line
-    // is already on the wire. That costs the real status on a non-200 (relayed
-    // as an SSE error frame instead) but keeps every blocking wait somewhere
-    // sink.is_writable can observe the peer, so a client that disappears cannot
-    // strand the upstream transfer.
-    res.set_chunked_content_provider(
-        "text/event-stream",
-        [upstream = std::move(upstream), model](size_t offset, httplib::DataSink& sink) {
-            if (offset > 0) return false;
-            // Both ends speak Anthropic SSE, so a 200 relays unparsed. A
-            // non-200 body is not SSE, so it is diverted and re-emitted as an
-            // error event rather than written into the event stream.
-            static constexpr size_t max_error_body = 64 * 1024;
-            int upstream_status = 200;
-            std::string error_body;
-            std::map<std::string, std::string> response_headers;
-            auto emit_error = [&sink, &model](int status, const std::string& message) {
-                write_sse_event(sink, "error", anthropic::build_anthropic_error(
-                    json{{"message", "cloud request for '" + model + "' " + message}},
-                    status));
-            };
-
-            try {
-                auto result = utils::HttpClient::post_stream(
-                    upstream.url, upstream.body,
-                    [&](const char* data, size_t length) {
-                        if (upstream_status != 200) {
-                            if (error_body.size() < max_error_body) {
-                                error_body.append(
-                                    data,
-                                    std::min(length, max_error_body - error_body.size()));
-                            }
-                            return true;
-                        }
-                        return sink.write(data, length);
-                    },
-                    upstream.headers, 0,
-                    [&upstream_status](int status) { upstream_status = status; },
-                    upstream.policy,
-                    [&sink]() { return sink.is_writable && !sink.is_writable(); },
-                    &response_headers);
-                // on_status never fires when the body is empty, so fall back to
-                // the code curl always records after the transfer.
-                const int status =
-                    upstream_status != 200 ? upstream_status : result.status_code;
-                if (status != 200) {
-                    emit_error(status, "failed with status " + std::to_string(status) +
-                                       (error_body.empty() ? "" : ": " + error_body));
-                } else if (result.curl_code != 0 && sink.is_writable && sink.is_writable()) {
-                    emit_error(502, "stream ended early: " + result.curl_error);
-                }
-            } catch (const std::exception& e) {
-                emit_error(502, std::string("failed: ") + e.what());
-            }
-            sink.done();
-            return false;
-        }
-    );
-}
 
 }  // namespace
 
@@ -406,10 +314,14 @@ void OllamaApi::register_anthropic_routes(httplib::Server& server, const std::sh
     });
 }
 
-json OllamaApi::convert_anthropic_to_openai_chat(const json& anthropic_request, std::vector<std::string>& warnings) {
+json anthropic::convert_anthropic_to_openai_chat(const json& anthropic_request, std::vector<std::string>& warnings) {
     json openai_req;
 
-    std::string model = normalize_model_name(anthropic_request.value("model", ""));
+    std::string model = anthropic_request.value("model", "");
+    const std::string suffix = ":latest";
+    if (model.size() > suffix.size() && model.compare(model.size() - suffix.size(), suffix.size(), suffix) == 0) {
+        model.resize(model.size() - suffix.size());
+    }
     openai_req["model"] = model;
 
     json messages = json::array();
@@ -449,6 +361,7 @@ json OllamaApi::convert_anthropic_to_openai_chat(const json& anthropic_request, 
 
             json content_parts = json::array();
             std::vector<std::string> text_parts;
+            std::string reasoning_text;
             bool has_non_text = false;
             json assistant_tool_calls = json::array();
             std::vector<json> tool_result_messages;
@@ -466,6 +379,18 @@ json OllamaApi::convert_anthropic_to_openai_chat(const json& anthropic_request, 
                         content_parts.push_back({{"type", "text"}, {"text", text}});
                         text_parts.push_back(text);
                         continue;
+                    }
+
+                    if (type == "thinking" && role == "assistant" &&
+                        block.contains("thinking") && block["thinking"].is_string()) {
+                        reasoning_text += block["thinking"].get<std::string>();
+                        if (block.contains("signature")) {
+                            add_warning(warnings, "Removed thinking signature for OpenAI-compatible backend; reasoning text retained");
+                        }
+                        continue;
+                    }
+                    if (type == "redacted_thinking") {
+                        throw std::invalid_argument("Cannot translate opaque redacted_thinking to an OpenAI-compatible backend");
                     }
 
                     if (type == "image" && block.contains("source") && block["source"].is_object()) {
@@ -537,6 +462,12 @@ json OllamaApi::convert_anthropic_to_openai_chat(const json& anthropic_request, 
                             ? stringify_anthropic_tool_result_content(block["content"], warnings)
                             : std::string();
 
+                        if (!content_parts.empty()) {
+                            tool_result_messages.push_back({{"role", "user"}, {"content", has_non_text ? content_parts : json(join_strings(text_parts))}});
+                            content_parts = json::array();
+                            text_parts.clear();
+                            has_non_text = false;
+                        }
                         tool_result_messages.push_back({
                             {"role", "tool"},
                             {"tool_call_id", tool_use_id},
@@ -564,10 +495,16 @@ json OllamaApi::convert_anthropic_to_openai_chat(const json& anthropic_request, 
                 openai_msg["content"] = "";
             }
 
+            if (!reasoning_text.empty()) {
+                openai_msg["reasoning_content"] = reasoning_text;
+            }
             if (!assistant_tool_calls.empty()) {
                 openai_msg["tool_calls"] = assistant_tool_calls;
             }
 
+            for (const auto& tool_msg : tool_result_messages) {
+                messages.push_back(tool_msg);
+            }
             bool has_content = !content_parts.empty();
             bool has_tool_calls = !assistant_tool_calls.empty();
 
@@ -576,9 +513,7 @@ json OllamaApi::convert_anthropic_to_openai_chat(const json& anthropic_request, 
                 messages.push_back(openai_msg);
             }
 
-            for (const auto& tool_msg : tool_result_messages) {
-                messages.push_back(tool_msg);
-            }
+
         }
     }
 
@@ -677,12 +612,10 @@ json OllamaApi::convert_anthropic_to_openai_chat(const json& anthropic_request, 
 
     if (anthropic_request.contains("thinking") && anthropic_request["thinking"].is_object()) {
         std::string thinking_type = anthropic_request["thinking"].value("type", "");
-        if (thinking_type == "enabled") {
-            openai_req["enable_thinking"] = true;
-        } else if (thinking_type == "disabled") {
-            openai_req["enable_thinking"] = false;
-        } else {
+        if (!apply_anthropic_thinking_type(openai_req, thinking_type)) {
             add_warning(warnings, "Ignored unsupported thinking.type: " + thinking_type);
+        } else if (thinking_type == "adaptive") {
+            add_warning(warnings, "Adaptive thinking enables backend reasoning at its default effort; Anthropic adaptive budgeting is not emulated");
         }
     }
 
@@ -698,11 +631,12 @@ json OllamaApi::convert_anthropic_to_openai_chat(const json& anthropic_request, 
     return openai_req;
 }
 
-json OllamaApi::convert_openai_chat_to_anthropic(const json& openai_response,
+json anthropic::convert_openai_chat_to_anthropic(const json& openai_response,
                                                  const std::string& model,
                                                  const std::vector<std::string>& warnings) {
     std::vector<std::string> mutable_warnings = warnings;
     std::string response_text;
+    std::string response_reasoning;
     json content_blocks = json::array();
     std::string stop_reason = "end_turn";
     std::string response_id = openai_response.value("id", generate_anthropic_message_id());
@@ -714,6 +648,11 @@ json OllamaApi::convert_openai_chat_to_anthropic(const json& openai_response,
 
         if (choice.contains("message") && choice["message"].is_object()) {
             const auto& message = choice["message"];
+            if (message.contains("reasoning_content") && message["reasoning_content"].is_string()) {
+                response_reasoning = message["reasoning_content"].get<std::string>();
+            } else if (message.contains("reasoning") && message["reasoning"].is_string()) {
+                response_reasoning = message["reasoning"].get<std::string>();
+            }
             if (message.contains("content") && message["content"].is_string()) {
                 response_text = message["content"].get<std::string>();
             } else if (message.contains("content") && message["content"].is_array()) {
@@ -733,7 +672,8 @@ json OllamaApi::convert_openai_chat_to_anthropic(const json& openai_response,
                         continue;
                     }
 
-                    std::string tool_id = tool_call.value("id", generate_anthropic_message_id());
+                    std::string tool_id = tool_call.value("id", std::string());
+                    if (tool_id.empty()) throw std::invalid_argument("tool response missing call ID");
                     std::string tool_name;
                     if (tool_call.contains("function") && tool_call["function"].is_object()) {
                         tool_name = tool_call["function"].value("name", "");
@@ -766,6 +706,13 @@ json OllamaApi::convert_openai_chat_to_anthropic(const json& openai_response,
         content_blocks = merged_blocks;
     }
 
+    if (!response_reasoning.empty()) {
+        json with_reasoning = json::array();
+        with_reasoning.push_back({{"type", "thinking"}, {"thinking", response_reasoning}});
+        for (const auto& block : content_blocks) with_reasoning.push_back(block);
+        content_blocks = std::move(with_reasoning);
+    }
+
     if (stop_reason == "end_turn") {
         for (const auto& block : content_blocks) {
             if (block.is_object() && block.value("type", "") == "tool_use") {
@@ -775,13 +722,7 @@ json OllamaApi::convert_openai_chat_to_anthropic(const json& openai_response,
         }
     }
 
-    int input_tokens = 0;
-    int output_tokens = 0;
-    if (openai_response.contains("usage") && openai_response["usage"].is_object()) {
-        const auto& usage = openai_response["usage"];
-        input_tokens = usage.value("prompt_tokens", 0);
-        output_tokens = usage.value("completion_tokens", 0);
-    }
+    const json usage = anthropic_usage_from_chat(openai_response.value("usage", json::object()), mutable_warnings);
 
     json anthropic_res = {
         {"id", response_id},
@@ -791,10 +732,7 @@ json OllamaApi::convert_openai_chat_to_anthropic(const json& openai_response,
         {"content", content_blocks},
         {"stop_reason", stop_reason},
         {"stop_sequence", nullptr},
-        {"usage", {
-            {"input_tokens", input_tokens},
-            {"output_tokens", output_tokens}
-        }}
+        {"usage", usage}
     };
 
     if (!mutable_warnings.empty()) {
@@ -804,340 +742,143 @@ json OllamaApi::convert_openai_chat_to_anthropic(const json& openai_response,
     return anthropic_res;
 }
 
-void OllamaApi::stream_openai_sse_to_anthropic_sse(const std::string& openai_body,
+void anthropic::stream_openai_sse_to_anthropic_sse(const std::string& openai_body,
                                                    httplib::DataSink& client_sink,
                                                    const std::string& model,
                                                    const std::vector<std::string>& warnings,
-                                                   StreamFn call_router) {
+                                                   anthropic::StreamFn call_router) {
     httplib::DataSink adapter_sink;
-    std::string sse_buffer;
-
-    bool sent_message_start = false;
-    bool sent_text_content_start = false;
-    bool sent_text_content_stop = false;
-    bool sent_error = false;
-    std::vector<bool> started_tool_blocks;
-    std::vector<bool> stopped_tool_blocks;
-    std::vector<std::string> tool_ids;
-    std::vector<std::string> tool_names;
-    std::string stop_reason = "end_turn";
-    int input_tokens = 0;
-    int output_tokens = 0;
-    std::string message_id = generate_anthropic_message_id();
-
+    std::string buffer, stop_reason = "end_turn";
+    bool started = false, failed = false, finished = false;
+    int next_index = 0, active_index = -1;
+    std::string active_kind;
+    json usage = json::object();
+    struct ToolBlock { int index; std::string id; std::string name; };
+    std::map<int, ToolBlock> tools;
+    auto emit = [&](const std::string& event, const json& data) {
+        if (failed) return false;
+        if (!write_sse_event(client_sink, event, data)) { failed = true; return false; }
+        return true;
+    };
+    auto close_active = [&]() {
+        if (active_index < 0) return true;
+        if (!emit("content_block_stop", {{"type", "content_block_stop"}, {"index", active_index}})) return false;
+        active_index = -1;
+        active_kind.clear();
+        return true;
+    };
+    auto fail = [&](const std::string& message) {
+        if (!failed) write_sse_event(client_sink, "error", {{"type", "error"}, {"error", {{"type", "api_error"}, {"message", message}}}});
+        failed = true;
+    };
+    auto content_delta = [&](const std::string& kind, const std::string& text) {
+        if (text.empty()) return true;
+        if (active_kind != kind) {
+            if (!close_active()) return false;
+            active_kind = kind;
+            active_index = next_index++;
+            const std::string field = kind == "thinking" ? "thinking" : "text";
+            if (!emit("content_block_start", {{"type", "content_block_start"}, {"index", active_index}, {"content_block", {{"type", kind}, {field, ""}}}})) return false;
+        }
+        const std::string field = kind == "thinking" ? "thinking" : "text";
+        return emit("content_block_delta", {{"type", "content_block_delta"}, {"index", active_index}, {"delta", {{"type", kind == "thinking" ? "thinking_delta" : "text_delta"}, {field, text}}}});
+    };
     adapter_sink.is_writable = client_sink.is_writable;
-
-    adapter_sink.write = [&client_sink,
-                          &sse_buffer,
-                          &sent_message_start,
-                          &sent_text_content_start,
-                          &sent_text_content_stop,
-                          &sent_error,
-                          &started_tool_blocks,
-                          &stopped_tool_blocks,
-                          &tool_ids,
-                          &tool_names,
-                          &stop_reason,
-                          &input_tokens,
-                          &output_tokens,
-                          &message_id,
-                          &model](const char* data, size_t len) -> bool {
-        sse_buffer.append(data, len);
-
+    adapter_sink.write = [&](const char* data, size_t len) {
+        if (failed) return false;
+        buffer.append(data, len);
         size_t pos;
-        while ((pos = sse_buffer.find('\n')) != std::string::npos) {
-            std::string line = sse_buffer.substr(0, pos);
-            sse_buffer.erase(0, pos + 1);
-
-            if (!line.empty() && line.back() == '\r') {
-                line.pop_back();
-            }
-
-            if (line.empty() || line.find("data: ") != 0) {
-                continue;
-            }
-
-            std::string json_str = line.substr(6);
-            if (json_str == "[DONE]") {
-                continue;
-            }
-
+        while ((pos = buffer.find('\n')) != std::string::npos) {
+            std::string line = buffer.substr(0, pos);
+            buffer.erase(0, pos + 1);
+            if (!line.empty() && line.back() == '\r') line.pop_back();
+            if (line.rfind("data:", 0) != 0) continue;
+            std::string payload = line.substr(5);
+            if (!payload.empty() && payload[0] == ' ') payload.erase(0, 1);
+            if (payload == "[DONE]") continue;
             try {
-                auto openai_chunk = json::parse(json_str);
-
-                if (openai_chunk.contains("error")) {
-                    const auto& error = openai_chunk["error"];
-                    std::cerr << "[OllamaApi] Backend error in Anthropic stream: "
-                              << error.dump() << std::endl;
-                    sent_error = true;
-                    write_sse_event(client_sink, "error",
-                                    anthropic::build_anthropic_error(
-                                        error, anthropic::backend_error_http_status(error)));
-                    return false;
+                const auto chunk = json::parse(payload);
+                if (chunk.contains("error")) { fail(chunk["error"].dump()); return false; }
+                if (!started) {
+                    if (!emit("message_start", {{"type", "message_start"}, {"message", {
+                        {"id", chunk.value("id", generate_anthropic_message_id())}, {"type", "message"},
+                        {"role", "assistant"}, {"model", model}, {"content", json::array()},
+                        {"stop_reason", nullptr}, {"stop_sequence", nullptr},
+                        {"usage", json::object()}
+                    }}})) return false;
+                    started = true;
                 }
-
-                if (!sent_message_start) {
-                    if (openai_chunk.contains("id") && openai_chunk["id"].is_string()) {
-                        message_id = openai_chunk["id"].get<std::string>();
+                if (chunk.contains("usage") && chunk["usage"].is_object()) {
+                    usage.update(chunk["usage"]);
+                }
+                if (!chunk.contains("choices") || !chunk["choices"].is_array() || chunk["choices"].empty()) continue;
+                const auto& choice = chunk["choices"][0];
+                if (choice.contains("delta") && choice["delta"].is_object()) {
+                    const auto& delta = choice["delta"];
+                    if (delta.contains("reasoning_content") && delta["reasoning_content"].is_string()) {
+                        if (!content_delta("thinking", delta["reasoning_content"].get<std::string>())) return false;
+                    } else if (delta.contains("reasoning") && delta["reasoning"].is_string()) {
+                        if (!content_delta("thinking", delta["reasoning"].get<std::string>())) return false;
                     }
-
-                    json message_start = {
-                        {"type", "message_start"},
-                        {"message", {
-                            {"id", message_id},
-                            {"type", "message"},
-                            {"role", "assistant"},
-                            {"model", model},
-                            {"content", json::array()},
-                            {"stop_reason", nullptr},
-                            {"stop_sequence", nullptr},
-                            {"usage", {{"input_tokens", 0}, {"output_tokens", 0}}}
-                        }}
-                    };
-                    if (!write_sse_event(client_sink, "message_start", message_start)) {
-                        return false;
+                    if (delta.contains("content") && delta["content"].is_string()) {
+                        if (!content_delta("text", delta["content"].get<std::string>())) return false;
                     }
-                    sent_message_start = true;
-                }
-
-                if (openai_chunk.contains("usage") && openai_chunk["usage"].is_object()) {
-                    const auto& usage = openai_chunk["usage"];
-                    input_tokens = usage.value("prompt_tokens", input_tokens);
-                    output_tokens = usage.value("completion_tokens", output_tokens);
-                }
-
-                if (openai_chunk.contains("choices") && openai_chunk["choices"].is_array() &&
-                    !openai_chunk["choices"].empty()) {
-                    const auto& choice = openai_chunk["choices"][0];
-
-                    if (choice.contains("delta") && choice["delta"].is_object()) {
-                        const auto& delta = choice["delta"];
-                        if (delta.contains("content") && delta["content"].is_string()) {
-                            std::string delta_text = delta["content"].get<std::string>();
-                            if (!delta_text.empty()) {
-                                if (!sent_text_content_start) {
-                                    json content_start = {
-                                        {"type", "content_block_start"},
-                                        {"index", 0},
-                                        {"content_block", {{"type", "text"}, {"text", ""}}}
-                                    };
-                                    if (!write_sse_event(client_sink, "content_block_start", content_start)) {
-                                        return false;
-                                    }
-                                    sent_text_content_start = true;
-                                }
-
-                                json content_delta = {
-                                    {"type", "content_block_delta"},
-                                    {"index", 0},
-                                    {"delta", {{"type", "text_delta"}, {"text", delta_text}}}
-                                };
-                                if (!write_sse_event(client_sink, "content_block_delta", content_delta)) {
-                                    return false;
-                                }
+                    if (delta.contains("tool_calls") && delta["tool_calls"].is_array()) {
+                        for (const auto& tool : delta["tool_calls"]) {
+                            const int source_index = tool.value("index", 0);
+                            if (source_index < 0) throw std::invalid_argument("negative tool index");
+                            const auto fn = tool.value("function", json::object());
+                            auto it = tools.find(source_index);
+                            if (it == tools.end()) {
+                                const auto name = fn.value("name", std::string());
+                                if (name.empty()) throw std::invalid_argument("tool stream started without function name");
+                                if (!close_active()) return false;
+                                const auto id = tool.value("id", std::string());
+                                if (id.empty()) throw std::invalid_argument("tool stream started without call ID");
+                                ToolBlock block{next_index++, id, name};
+                                it = tools.emplace(source_index, block).first;
+                                if (!emit("content_block_start", {{"type", "content_block_start"}, {"index", block.index}, {"content_block", {
+                                    {"type", "tool_use"}, {"id", block.id}, {"name", block.name}, {"input", json::object()}
+                                }}})) return false;
+                            } else if ((tool.contains("id") && tool["id"] != it->second.id) ||
+                                       (fn.contains("name") && fn["name"] != it->second.name)) {
+                                throw std::invalid_argument("tool identity changed during stream");
                             }
-                        }
-
-                        if (delta.contains("tool_calls") && delta["tool_calls"].is_array()) {
-                            for (const auto& tool_delta : delta["tool_calls"]) {
-                                if (!tool_delta.is_object()) {
-                                    continue;
-                                }
-
-                                int openai_tool_index = tool_delta.value("index", 0);
-                                if (openai_tool_index < 0) {
-                                    continue;
-                                }
-
-                                size_t idx = static_cast<size_t>(openai_tool_index);
-                                if (started_tool_blocks.size() <= idx) {
-                                    started_tool_blocks.resize(idx + 1, false);
-                                    stopped_tool_blocks.resize(idx + 1, false);
-                                    tool_ids.resize(idx + 1);
-                                    tool_names.resize(idx + 1);
-                                }
-
-                                if (tool_delta.contains("id") && tool_delta["id"].is_string()) {
-                                    tool_ids[idx] = tool_delta["id"].get<std::string>();
-                                }
-
-                                if (tool_delta.contains("function") && tool_delta["function"].is_object()) {
-                                    const auto& fn = tool_delta["function"];
-                                    if (fn.contains("name") && fn["name"].is_string()) {
-                                        tool_names[idx] = fn["name"].get<std::string>();
-                                    }
-                                }
-
-                                if (!started_tool_blocks[idx]) {
-                                    if (tool_ids[idx].empty()) {
-                                        tool_ids[idx] = generate_anthropic_message_id();
-                                    }
-                                    if (tool_names[idx].empty()) {
-                                        tool_names[idx] = "unknown_tool";
-                                    }
-
-                                    json tool_block_start = {
-                                        {"type", "content_block_start"},
-                                        {"index", static_cast<int>(idx) + 1},
-                                        {"content_block", {
-                                            {"type", "tool_use"},
-                                            {"id", tool_ids[idx]},
-                                            {"name", tool_names[idx]},
-                                            {"input", json::object()}
-                                        }}
-                                    };
-                                    if (!write_sse_event(client_sink, "content_block_start", tool_block_start)) {
-                                        return false;
-                                    }
-                                    started_tool_blocks[idx] = true;
-                                }
-
-                                if (tool_delta.contains("function") && tool_delta["function"].is_object()) {
-                                    const auto& fn = tool_delta["function"];
-                                    if (fn.contains("arguments") && fn["arguments"].is_string()) {
-                                        std::string args_delta = fn["arguments"].get<std::string>();
-                                        if (!args_delta.empty()) {
-                                            json tool_input_delta = {
-                                                {"type", "content_block_delta"},
-                                                {"index", static_cast<int>(idx) + 1},
-                                                {"delta", {
-                                                    {"type", "input_json_delta"},
-                                                    {"partial_json", args_delta}
-                                                }}
-                                            };
-                                            if (!write_sse_event(client_sink, "content_block_delta", tool_input_delta)) {
-                                                return false;
-                                            }
-                                        }
-                                    }
-                                }
+                            if (fn.contains("arguments") && fn["arguments"].is_string() && !fn["arguments"].get<std::string>().empty()) {
+                                if (!emit("content_block_delta", {{"type", "content_block_delta"}, {"index", it->second.index}, {"delta", {
+                                    {"type", "input_json_delta"}, {"partial_json", fn["arguments"]}
+                                }}})) return false;
                             }
                         }
                     }
-
-                    if (choice.contains("finish_reason") && !choice["finish_reason"].is_null()) {
-                        stop_reason = map_finish_reason_to_anthropic_stop_reason(choice);
-                    }
                 }
-            } catch (const std::exception& e) {
-                std::cerr << "[OllamaApi] Failed to parse Anthropic stream chunk: " << e.what() << std::endl;
-            }
+                if (choice.contains("finish_reason") && !choice["finish_reason"].is_null()) {
+                    stop_reason = map_finish_reason_to_anthropic_stop_reason(choice);
+                    finished = true;
+                }
+            } catch (const std::exception& e) { fail(e.what()); return false; }
         }
         return true;
     };
-
-    adapter_sink.done = [&client_sink,
-                         &sent_message_start,
-                         &sent_text_content_start,
-                         &sent_text_content_stop,
-                         &sent_error,
-                         &started_tool_blocks,
-                         &stopped_tool_blocks,
-                         &stop_reason,
-                         &input_tokens,
-                         &output_tokens,
-                         &warnings]() {
-        // The error event terminates the stream. Emitting the closing frames
-        // here would let a client read the failure as a turn that produced no
-        // content, which is the state this path exists to avoid.
-        if (sent_error) {
-            client_sink.done();
-            return;
+    adapter_sink.done = [&]() {
+        if (!failed && (!started || !finished || !buffer.empty())) fail("Backend stream ended without a complete terminal response");
+        if (failed) { client_sink.done(); return; }
+        if (!close_active()) { client_sink.done(); return; }
+        for (const auto& entry : tools) {
+            if (!emit("content_block_stop", {{"type", "content_block_stop"}, {"index", entry.second.index}})) { client_sink.done(); return; }
         }
-
-        if (!sent_message_start) {
-            json message_start = {
-                {"type", "message_start"},
-                {"message", {
-                    {"id", generate_anthropic_message_id()},
-                    {"type", "message"},
-                    {"role", "assistant"},
-                    {"content", json::array()},
-                    {"stop_reason", nullptr},
-                    {"stop_sequence", nullptr},
-                    {"usage", {{"input_tokens", 0}, {"output_tokens", 0}}}
-                }}
-            };
-            if (!write_sse_event(client_sink, "message_start", message_start)) {
-                client_sink.done();
-                return;
-            }
-            sent_message_start = true;
-        }
-
-        if (!sent_text_content_start && started_tool_blocks.empty()) {
-            json content_start = {
-                {"type", "content_block_start"},
-                {"index", 0},
-                {"content_block", {{"type", "text"}, {"text", ""}}}
-            };
-            if (!write_sse_event(client_sink, "content_block_start", content_start)) {
-                client_sink.done();
-                return;
-            }
-            sent_text_content_start = true;
-        }
-
-        if (sent_text_content_start && !sent_text_content_stop) {
-            json content_stop = {
-                {"type", "content_block_stop"},
-                {"index", 0}
-            };
-            if (!write_sse_event(client_sink, "content_block_stop", content_stop)) {
-                client_sink.done();
-                return;
-            }
-            sent_text_content_stop = true;
-        }
-
-        for (size_t idx = 0; idx < started_tool_blocks.size(); ++idx) {
-            if (started_tool_blocks[idx] && !stopped_tool_blocks[idx]) {
-                json tool_stop = {
-                    {"type", "content_block_stop"},
-                    {"index", static_cast<int>(idx) + 1}
-                };
-                if (!write_sse_event(client_sink, "content_block_stop", tool_stop)) {
-                    client_sink.done();
-                    return;
-                }
-                stopped_tool_blocks[idx] = true;
-            }
-        }
-
-        if (stop_reason == "end_turn") {
-            for (bool started : started_tool_blocks) {
-                if (started) {
-                    stop_reason = "tool_use";
-                    break;
-                }
-            }
-        }
-
-        json message_delta = {
-            {"type", "message_delta"},
-            {"delta", {
-                {"stop_reason", stop_reason},
-                {"stop_sequence", nullptr}
-            }},
-            {"usage", {
-                {"input_tokens", input_tokens},
-                {"output_tokens", output_tokens}
-            }}
-        };
-        if (!warnings.empty()) {
-            message_delta["warnings"] = warnings;
-        }
-        if (!write_sse_event(client_sink, "message_delta", message_delta)) {
-            client_sink.done();
-            return;
-        }
-
-        json message_stop = {{"type", "message_stop"}};
-        write_sse_event(client_sink, "message_stop", message_stop);
+        if (stop_reason == "end_turn" && !tools.empty()) stop_reason = "tool_use";
+        auto final_warnings = warnings;
+        const auto translated_usage = anthropic_usage_from_chat(usage, final_warnings);
+        json message_delta = {{"type", "message_delta"}, {"delta", {{"stop_reason", stop_reason}, {"stop_sequence", nullptr}}},
+                              {"usage", translated_usage}};
+        if (!final_warnings.empty()) message_delta["warnings"] = final_warnings;
+        if (emit("message_delta", message_delta)) emit("message_stop", {{"type", "message_stop"}});
         client_sink.done();
     };
-
-    call_router(openai_body, adapter_sink);
+    auto request = json::parse(openai_body);
+    request["stream_options"]["include_usage"] = true;
+    call_router(request.dump(), adapter_sink);
 }
 
 void OllamaApi::handle_anthropic_messages(const httplib::Request& req, httplib::Response& res) {
@@ -1150,6 +891,62 @@ void OllamaApi::handle_anthropic_messages(const httplib::Request& req, httplib::
             res.status = 400;
             res.set_content(R"({"type":"error","error":{"type":"invalid_request_error","message":"model is required"}})", "application/json");
             return;
+        }
+
+        if (model_manager_->model_exists(model)) {
+            const auto info = model_manager_->get_model_info(model);
+            if (info.route_policy && info.route_policy->arc_router) {
+                try {
+                    arc_require(info.route_policy->arc_session.has_value(),
+                                "Native Messages requires ARC session configuration");
+                    const auto& config = *info.route_policy->arc_router;
+                    bool has_native_candidate = false;
+                    for (const auto& action : config.at("actions")) {
+                        const auto candidate = model_manager_->get_model_info(action.at("model").get<std::string>());
+                        const auto registry = model_manager_->cloud_registry();
+                        if ((candidate.recipe == "cloud" && registry &&
+                             registry->wire_format_for(candidate.cloud_provider) == "anthropic") ||
+                            (!info.route_policy->arc_session->codec_sha256.empty() &&
+                             (candidate.recipe == "llamacpp" || (candidate.recipe == "cloud" && registry &&
+                              registry->wire_format_for(candidate.cloud_provider) == "openai")))) has_native_candidate = true;
+                    }
+                    arc_require(has_native_candidate, "ARC collection has no native Anthropic Messages candidates");
+                    const auto identity = arc_messages_identity([&req](const char* name) -> std::optional<std::string> {
+                        if (!req.has_header(name)) return std::nullopt;
+                        return req.get_header_value(name);
+                    }, request_json);
+                    auto prepared = prepare_arc_session(config, *info.route_policy->arc_session,
+                        identity, request_json, "anthropic_messages", req.is_connection_closed);
+                    const auto action = prepared->receipt().at("action_id").get<std::string>();
+                    const auto selected = config.at("actions").at(action).at("model").get<std::string>();
+                    if (prepared->receipt().at("request_format") == "openai_chat") {
+                        const auto candidate = model_manager_->get_model_info(selected);
+                        const auto registry = model_manager_->cloud_registry();
+                        arc_require((candidate.recipe == "llamacpp" && prepared->request().at("model") == selected) || (candidate.recipe == "cloud" && registry &&
+                            registry->wire_format_for(candidate.cloud_provider) == "openai" &&
+                            candidate.checkpoint() == prepared->request().at("model")),
+                            "ARC prepared Chat requires a matching registered Chat provider or llama.cpp model");
+                        auto_load_model(selected, extract_auto_load_options(prepared->request()));
+                        json routing_request = prepared->request();
+                        routing_request["model"] = selected;
+                        res.set_header("x-lemonade-route", "arc_session");
+                        forward_arc_chat(router_, std::move(routing_request), prepared, res, req.is_connection_closed);
+                        return;
+                    }
+                    auto match = resolve_anthropic_upstream(model_manager_, selected, prepared->request(), req, true);
+                    arc_require(match.claimed, "ARC native Messages requires a registered Anthropic-format provider");
+                    if (!match.upstream) {
+                        set_anthropic_error_response(res, match.error_status, match.error_message);
+                        return;
+                    }
+                    res.set_header("x-lemonade-route", "arc_session");
+                    forward_anthropic_upstream(std::move(*match.upstream), request_json.value("stream", false),
+                        selected, res, prepared, req.is_connection_closed);
+                } catch (const std::exception& e) {
+                    set_anthropic_error_response(res, 502, e.what());
+                }
+                return;
+            }
         }
 
         if (req.has_param("beta")) {
@@ -1186,7 +983,13 @@ void OllamaApi::handle_anthropic_messages(const httplib::Request& req, httplib::
             return;
         }
 
-        auto openai_req = convert_anthropic_to_openai_chat(request_json, warnings);
+        json openai_req;
+        try {
+            openai_req = anthropic::convert_anthropic_to_openai_chat(request_json, warnings);
+        } catch (const std::invalid_argument& e) {
+            set_anthropic_error_response(res, 400, e.what());
+            return;
+        }
 
         try {
             auto_load_model(model, extract_auto_load_options(request_json));
@@ -1222,7 +1025,7 @@ void OllamaApi::handle_anthropic_messages(const httplib::Request& req, httplib::
                 [this, openai_body, model, warnings](size_t offset, httplib::DataSink& sink) {
                     if (offset > 0) return false;
 
-                    stream_openai_sse_to_anthropic_sse(openai_body, sink, model, warnings,
+                    anthropic::stream_openai_sse_to_anthropic_sse(openai_body, sink, model, warnings,
                         [this](const std::string& body, httplib::DataSink& s) {
                             router_->chat_completion_stream(body, s);
                         }
@@ -1240,7 +1043,7 @@ void OllamaApi::handle_anthropic_messages(const httplib::Request& req, httplib::
             return;
         }
 
-        auto anthropic_response = convert_openai_chat_to_anthropic(openai_response, model, warnings);
+        auto anthropic_response = anthropic::convert_openai_chat_to_anthropic(openai_response, model, warnings);
         res.set_content(anthropic_response.dump(), "application/json");
 
     } catch (const std::exception& e) {

@@ -327,6 +327,7 @@ struct Decision {
     std::string matched_rule;              // matched rule id, empty if defaulted
     bool default_used = false;             // true => fell through to default_model
     json outputs = json::object();         // verbatim from the matched rule
+    json request_overrides = json::object();
     std::vector<TraceEntry> trace;         // populated only when trace requested
 
     Decision() = default;
@@ -449,7 +450,15 @@ NamedLeafFactories make_deterministic_leaf_factories();
 
 // The parsed, resolved routing policy (produced by the parser). Classifier
 // condition refs in the rules resolve against `classifiers` by id.
+struct ArcSessionConfig {
+    std::string endpoint;
+    std::string owner_id;
+    std::string codec_sha256;
+};
+
 struct RoutePolicy {
+    std::optional<json> arc_router;
+    std::optional<ArcSessionConfig> arc_session;
     std::vector<std::string> candidates;                 // routing targets
     std::string default_model;                           // fail-open target ∈ candidates
     std::vector<Rule> rules;                             // ordered, first-match-wins

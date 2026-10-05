@@ -16,9 +16,14 @@ struct AgentConfig {
 };
 
 struct AgentLaunchOptions {
+    std::string claude_fresh_profile;
+    int claude_context_tokens = 0;
     bool codex_use_user_config = false;
     std::string codex_model_provider = "lemonade";
 };
+
+bool validate_claude_launch_options(const AgentLaunchOptions& options, std::string& error_message);
+bool prepare_claude_profile(const AgentLaunchOptions& options, std::string& error_message);
 
 // Returns true if the agent requires file-based config sync before launch.
 bool agent_needs_config_sync(const std::string& agent);

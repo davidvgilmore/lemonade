@@ -1419,6 +1419,7 @@ RoutingPolicyEngine::RoutingPolicyEngine(RoutePolicy policy, ClassifierServices 
 }
 
 Decision RoutingPolicyEngine::route(const RouteContext& ctx, bool want_trace) const {
+    if (policy_.arc_router) throw std::runtime_error("ARC routing requires the native decision adapter");
     EvalContext eval{ctx, services_, want_trace, {}, {}, {}};
 
     // First-match-wins over the compiled rules. A classifier-level failure is

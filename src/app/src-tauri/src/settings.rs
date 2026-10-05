@@ -1,4 +1,4 @@
-//! App-settings persistence. Reads and writes `~/.config/lemonade/app_settings.json`,
+//! App-settings persistence in the platform config directory or isolated profile,
 //! sanitizing values and applying defaults for missing/invalid fields before
 //! handing the struct back to the renderer. The JSON shape matches what the
 //! existing React renderer expects (each user-tunable field is a
@@ -13,6 +13,9 @@ const SETTINGS_FILE_NAME: &str = "app_settings.json";
 
 // ---------- Default values ----------
 
+fn default_max_output_tokens() -> i64 {
+    4096
+}
 fn default_temperature() -> f64 {
     0.7
 }
@@ -140,6 +143,7 @@ pub struct ModelManagerSettings {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct AppSettings {
+    pub max_output_tokens: TypedSetting,
     pub temperature: TypedSetting,
     pub top_k: TypedSetting,
     pub top_p: TypedSetting,
@@ -161,6 +165,10 @@ pub struct AppSettings {
 impl Default for AppSettings {
     fn default() -> Self {
         AppSettings {
+            max_output_tokens: TypedSetting {
+                value: Value::from(default_max_output_tokens()),
+                use_default: true,
+            },
             temperature: TypedSetting {
                 value: json_num(default_temperature()),
                 use_default: true,
@@ -203,6 +211,9 @@ impl Default for AppSettings {
 // ---------- Path helpers ----------
 
 fn settings_file_path() -> Option<PathBuf> {
+    if let Some(profile) = crate::profile::current() {
+        return Some(profile.directory.join(SETTINGS_FILE_NAME));
+    }
     Some(
         dirs::config_dir()?
             .join("lemonade")
@@ -220,6 +231,9 @@ fn legacy_settings_file_path() -> Option<PathBuf> {
 }
 
 fn migrate_legacy_settings_file() {
+    if crate::profile::current().is_some() {
+        return;
+    }
     let (Some(new_path), Some(old_path)) = (settings_file_path(), legacy_settings_file_path())
     else {
         return;
@@ -306,6 +320,13 @@ fn extract_clamped_i64(min: i64, max: i64) -> impl Fn(&Value) -> Option<Value> {
 /// byte-for-byte so renderer state round-trips without drift.
 pub(crate) fn sanitize_app_settings(incoming: &Value) -> AppSettings {
     let mut s = AppSettings::default();
+
+    apply_typed_setting(
+        incoming,
+        "maxOutputTokens",
+        &mut s.max_output_tokens,
+        extract_clamped_i64(1, 1_048_576),
+    );
 
     apply_typed_setting(
         incoming,
@@ -422,7 +443,14 @@ pub(crate) fn read_app_settings() -> AppSettings {
         return AppSettings::default();
     };
 
-    match fs::read_to_string(&path) {
+    read_settings_file(&path, crate::profile::current())
+}
+
+fn read_settings_file(
+    path: &std::path::Path,
+    profile: Option<&crate::profile::IsolatedProfile>,
+) -> AppSettings {
+    let settings = match fs::read_to_string(path) {
         Ok(content) => match serde_json::from_str::<Value>(&content) {
             Ok(value) => sanitize_app_settings(&value),
             Err(err) => {
@@ -435,7 +463,19 @@ pub(crate) fn read_app_settings() -> AppSettings {
             log::error!("Failed to read app settings file: {err}");
             AppSettings::default()
         }
+    };
+    with_profile_url(settings, profile)
+}
+
+fn with_profile_url(
+    mut settings: AppSettings,
+    profile: Option<&crate::profile::IsolatedProfile>,
+) -> AppSettings {
+    if let Some(profile) = profile {
+        settings.base_url.value = Value::String(profile.server_url.clone());
+        settings.base_url.use_default = false;
     }
+    settings
 }
 
 pub(crate) fn write_app_settings(incoming: &Value) -> Result<AppSettings, String> {
@@ -443,7 +483,22 @@ pub(crate) fn write_app_settings(incoming: &Value) -> Result<AppSettings, String
     let path = settings_file_path()
         .ok_or_else(|| "Unable to locate the Lemonade home directory".to_string())?;
 
+    write_settings_file(&path, incoming, crate::profile::current())
+}
+
+fn write_settings_file(
+    path: &std::path::Path,
+    incoming: &Value,
+    profile: Option<&crate::profile::IsolatedProfile>,
+) -> Result<AppSettings, String> {
     let sanitized = sanitize_app_settings(incoming);
+    if let Some(profile) = profile {
+        if sanitized.base_url.use_default
+            || sanitized.base_url.value.as_str() != Some(profile.server_url.as_str())
+        {
+            return Err("Server URL is fixed by --server-url in isolated mode; restart with a different URL to change it".into());
+        }
+    }
 
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent).map_err(|e| format!("create_dir_all failed: {e}"))?;
@@ -494,6 +549,52 @@ pub(crate) fn normalize_server_url(url: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn isolated_settings_roundtrip_pins_url_and_refuses_switching_to_discovery() {
+        let directory = std::env::temp_dir().join(format!(
+            "lemonade-settings-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let profile = crate::profile::IsolatedProfile {
+            directory: directory.clone(),
+            server_url: "http://127.0.0.1:1234".into(),
+        };
+        let path = directory.join(SETTINGS_FILE_NAME);
+        let mut settings = serde_json::to_value(read_settings_file(&path, Some(&profile))).unwrap();
+        assert_eq!(settings["baseURL"]["value"], profile.server_url);
+        assert_eq!(settings["baseURL"]["useDefault"], false);
+        settings["maxOutputTokens"] = json!({"value": 8192, "useDefault": false});
+        settings["layout"]["theme"] = Value::String("light".into());
+        write_settings_file(&path, &settings, Some(&profile)).unwrap();
+        let before = fs::read(&path).unwrap();
+        let reopened = serde_json::to_value(read_settings_file(&path, Some(&profile))).unwrap();
+        assert_eq!(reopened["maxOutputTokens"], settings["maxOutputTokens"]);
+        assert_eq!(
+            reopened["temperature"],
+            json!({"value": 0.7, "useDefault": true})
+        );
+        assert_eq!(
+            read_settings_file(&path, Some(&profile)).layout.theme,
+            "light"
+        );
+        settings["baseURL"]["useDefault"] = Value::Bool(true);
+        assert!(write_settings_file(&path, &settings, Some(&profile)).is_err());
+        settings["baseURL"]["useDefault"] = Value::Bool(false);
+        settings["baseURL"]["value"] = Value::String("http://different:9999".into());
+        assert!(write_settings_file(&path, &settings, Some(&profile)).is_err());
+        assert_eq!(before, fs::read(&path).unwrap());
+        assert_eq!(
+            read_settings_file(&path, Some(&profile)).base_url.value,
+            profile.server_url
+        );
+        fs::remove_dir_all(directory).unwrap();
+    }
+
     use serde_json::json;
 
     /// The renderer's TS types use uppercase acronyms (`baseURL`, `enableTTS`,
@@ -586,6 +687,42 @@ mod tests {
             .pointer("/modelManager/showDownloadedOnly")
             .and_then(|v| v.as_bool());
         assert_eq!(show_downloaded_only, Some(true));
+    }
+
+    #[test]
+    fn max_output_tokens_sanitizes_like_renderer_integer_settings() {
+        for (value, expected) in [
+            (json!(0), 1),
+            (json!(1_048_577), 1_048_576),
+            (json!(512.6), 513),
+            (json!("8192"), 4096),
+            (json!(true), 4096),
+            (Value::Null, 4096),
+        ] {
+            let settings = sanitize_app_settings(&json!({
+                "maxOutputTokens": {"value": value, "useDefault": false}
+            }));
+            assert_eq!(settings.max_output_tokens.value, json!(expected));
+            assert!(!settings.max_output_tokens.use_default);
+        }
+        for incoming in [
+            json!({}),
+            json!({
+                "maxOutputTokens": {"value": 8192, "useDefault": true}
+            }),
+        ] {
+            let settings = serde_json::to_value(sanitize_app_settings(&incoming)).unwrap();
+            assert_eq!(
+                settings["maxOutputTokens"],
+                json!({"value": 4096, "useDefault": true})
+            );
+            assert_eq!(settings["topK"], json!({"value": 40, "useDefault": true}));
+            assert_eq!(settings["topP"], json!({"value": 0.9, "useDefault": true}));
+            assert_eq!(
+                settings["repeatPenalty"],
+                json!({"value": 1.1, "useDefault": true})
+            );
+        }
     }
 
     #[test]

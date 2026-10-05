@@ -1,3 +1,8 @@
+import { consumeChatStream } from '../../utils/chatStream';
+import { conversationWire, hasCompletedChatHistory, runChatToolLoop, ChatTurn } from '../../utils/chatToolLoop';
+import { appendChatDelta, ChatWireMessage } from '../../utils/chatWireMessage';
+import { createChatRequestIdentity } from '../../utils/chatRequestIdentity';
+import { chatResponseError } from '../../utils/chatResponseError';
 import React, { useState, useEffect, useRef, useMemo } from 'react';
 import MarkdownMessage from '../../MarkdownMessage';
 import AudioButton from '../../AudioButton';
@@ -27,6 +32,7 @@ import RecordButton from '../RecordButton';
 import {
   buildLemonadeTools,
   executeLemonadeTool,
+  serverChatTools,
   LemonadeToolsResult,
   ToolExecutionContext,
 } from '../../utils/lemonadeTools';
@@ -171,6 +177,7 @@ const LLMChatPanel: React.FC<LLMChatPanelProps> = ({
   const isChatModelLoaded = currentLoadedModel === chatModelName ||
     (currentLoadedModel !== null && routerCandidates.includes(currentLoadedModel));
 
+  const [requestIdentity] = useState(() => createChatRequestIdentity());
   const [messages, setMessages] = useState<Message[]>([]);
   const [inputValue, setInputValue] = useState('');
   const [editingIndex, setEditingIndex] = useState<number | null>(null);
@@ -498,9 +505,7 @@ const LLMChatPanel: React.FC<LLMChatPanelProps> = ({
 
   const buildChatRequestBody = (messageHistory: Message[]) => ({
     model: chatModelName,
-    // Strip UI-only fields (e.g. `thinking`) so strict providers like
-    // Fireworks don't 400 on unknown keys in the assistant turn.
-    messages: messageHistory.map(({ role, content }) => ({ role, content })),
+    messages: conversationWire(messageHistory),
     stream: true,
     ...buildChatRequestOverrides(appSettings),
   });
@@ -653,12 +658,12 @@ const LLMChatPanel: React.FC<LLMChatPanelProps> = ({
 
       const response = await serverFetch('/chat/completions', {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
+        headers: { 'Content-Type': 'application/json', ...requestIdentity() },
         body: JSON.stringify(requestBody),
         signal: abortControllerRef.current?.signal,
       });
 
-      if (!response.ok) throw new Error(`HTTP error! status: ${response.status}`);
+      if (!response.ok) throw await chatResponseError(response);
       const data = await response.json();
 
       // Notify UI that model is loaded on first response
@@ -811,6 +816,34 @@ const LLMChatPanel: React.FC<LLMChatPanelProps> = ({
   };
 
   const handleStreamingResponse = async (messageHistory: Message[]): Promise<void> => {
+    const tools = isRouterCollection(modelsData[selectedModel]) ? serverChatTools : [];
+    let completed: ChatTurn[] = [];
+    const publish = (turns: ChatTurn[]) => {
+      completed = turns;
+      setMessages(prev => {
+        const next = [...prev];
+        const last = next.length - 1;
+        next[last] = { ...next[last], wireHistory: turns, wireExcluded: false };
+        return next;
+      });
+    };
+    await runChatToolLoop(
+      conversationWire(messageHistory), tools.map(tool => tool.function.name),
+      history => streamChatTurn(messageHistory, history, tools, completed),
+      async call => {
+        const result = await executeLemonadeTool(call, chatModelName,
+          { extractedAudio: [], extractedImages: [], previousArtifacts: [] },
+          modelsData, abortControllerRef.current?.signal);
+        return result.text ?? '';
+      }, publish, abortControllerRef.current?.signal,
+    );
+  };
+
+  const streamChatTurn = async (
+    messageHistory: Message[], history: ChatTurn[],
+    tools: typeof serverChatTools, completed: ChatTurn[],
+  ): Promise<ChatWireMessage> => {
+    const wireMessage: ChatWireMessage = { role: 'assistant', content: '' };
     let accumulatedContent = '';
     let accumulatedThinking = '';
     let receivedFirstChunk = false;
@@ -837,6 +870,9 @@ const LLMChatPanel: React.FC<LLMChatPanelProps> = ({
           role: 'assistant',
           content: displayContent,
           thinking: totalThinking || undefined,
+          wireMessage: JSON.parse(JSON.stringify(wireMessage)),
+          wireHistory: completed,
+          wireExcluded: true,
         };
         return newMessages;
       });
@@ -851,74 +887,43 @@ const LLMChatPanel: React.FC<LLMChatPanelProps> = ({
       }
     };
 
-    const requestBody = buildChatRequestBody(messageHistory);
+    const requestBody = { ...buildChatRequestBody(messageHistory), messages: history, ...(tools.length ? { tools } : {}) };
 
     const response = await serverFetch('/chat/completions', {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
+      headers: { 'Content-Type': 'application/json', ...requestIdentity() },
       body: JSON.stringify(requestBody),
       signal: abortControllerRef.current!.signal,
     });
 
-    if (!response.ok) throw new Error(`HTTP error! status: ${response.status}`);
+    if (!response.ok) throw await chatResponseError(response);
     if (!response.body) throw new Error('Response body is null');
 
     const reader = response.body.getReader();
-    const decoder = new TextDecoder();
-    // Buffer incomplete lines across chunks. webkit2gtk (Tauri on Linux)
-    // delivers fetch ReadableStream chunks with different boundaries than
-    // Chromium, so an SSE `data: {...}` payload may be split across two
-    // reads. Without this buffer the second half lacks the `data: ` prefix
-    // and gets silently discarded — manifesting as "only the first token"
-    // or "No content received from stream".
-    let lineBuffer = '';
-
     try {
-      while (true) {
-        const { done, value } = await reader.read();
-        if (done) break;
-
-        lineBuffer += decoder.decode(value, { stream: true });
-        const lines = lineBuffer.split('\n');
-        // Keep the last (potentially incomplete) line in the buffer.
-        lineBuffer = lines.pop() || '';
-
-        for (const line of lines) {
-          if (line.startsWith('data: ')) {
-            const data = line.slice(6).trim();
-            if (data === '[DONE]' || !data) continue;
-
-            try {
-              const parsed = JSON.parse(data);
-              const delta = parsed.choices?.[0]?.delta;
-              const content = delta?.content;
-              const thinkingContent = delta?.reasoning_content || delta?.thinking;
-
-              if (content) accumulatedContent += content;
-              if (thinkingContent) accumulatedThinking += thinkingContent;
-
-              if (content || thinkingContent) {
-                if (!receivedFirstChunk) {
-                  receivedFirstChunk = true;
-                  setCurrentLoadedModel(chatModelName);
-                  if (isNewModelLoad) {
-                    window.dispatchEvent(new CustomEvent('modelLoadEnd', { detail: { modelId: selectedModel } }));
-                  }
-                }
-                flushAssistantUpdate();
-              }
-            } catch (e) {
-              console.warn('Failed to parse SSE data:', data, e);
+      await consumeChatStream(reader, delta => {
+        appendChatDelta(wireMessage, delta);
+        const content = delta.content;
+        const thinkingContent = delta.reasoning_content || delta.reasoning || delta.thinking;
+        if (content) accumulatedContent += content;
+        if (thinkingContent) accumulatedThinking += thinkingContent;
+        if (content || thinkingContent) {
+          if (!receivedFirstChunk) {
+            receivedFirstChunk = true;
+            setCurrentLoadedModel(chatModelName);
+            if (isNewModelLoad) {
+              window.dispatchEvent(new CustomEvent('modelLoadEnd', { detail: { modelId: selectedModel } }));
             }
           }
+          flushAssistantUpdate();
         }
-      }
+      });
     } finally {
       flushAssistantUpdate(true);
-      reader.releaseLock();
     }
 
-    if (!accumulatedContent) throw new Error('No content received from stream');
+    if (!accumulatedContent && !accumulatedThinking && !(Array.isArray(wireMessage.tool_calls) && wireMessage.tool_calls.length)) throw new Error('No content received from stream');
+    return wireMessage;
   };
 
   const sendMessage = async (textOverride?: string) => {
@@ -980,7 +985,7 @@ const LLMChatPanel: React.FC<LLMChatPanelProps> = ({
         console.log('Request aborted - keeping partial response');
         setMessages(prev => {
           const lastMessage = prev[prev.length - 1];
-          if (!lastMessage || (!lastMessage.content && !lastMessage.thinking)) return prev.slice(0, -1);
+          if (!lastMessage || (!lastMessage.content && !lastMessage.thinking && !lastMessage.wireHistory?.length)) return prev.slice(0, -1);
           return prev;
         });
       } else {
@@ -988,8 +993,11 @@ const LLMChatPanel: React.FC<LLMChatPanelProps> = ({
         setMessages(prev => {
           const newMessages = [...prev];
           newMessages[newMessages.length - 1] = {
+            ...newMessages[newMessages.length - 1],
             role: 'assistant',
             content: buildErrorMessage(error),
+            wireExcluded: true,
+            wireBlocked: error.name === 'ChatHistoryError',
           };
           return newMessages;
         });
@@ -1002,7 +1010,10 @@ const LLMChatPanel: React.FC<LLMChatPanelProps> = ({
     }
   };
 
+  const routerHistoryCommitted = isRouterCollection(modelsData[selectedModel]) &&
+    hasCompletedChatHistory(messages);
   const submitEdit = async () => {
+    if (routerHistoryCommitted) { showError('Start a new chat to change earlier router messages.'); return; }
     if ((!editingValue.trim() && editingImages.length === 0 && editingAudio.length === 0) || editingIndex === null || isBusy) return;
 
     const ready = await runPreFlight('llm', {
@@ -1059,7 +1070,7 @@ const LLMChatPanel: React.FC<LLMChatPanelProps> = ({
         console.log('Request aborted - keeping partial response');
         setMessages(prev => {
           const lastMessage = prev[prev.length - 1];
-          if (!lastMessage || (!lastMessage.content && !lastMessage.thinking)) return prev.slice(0, -1);
+          if (!lastMessage || (!lastMessage.content && !lastMessage.thinking && !lastMessage.wireHistory?.length)) return prev.slice(0, -1);
           return prev;
         });
       } else {
@@ -1067,8 +1078,11 @@ const LLMChatPanel: React.FC<LLMChatPanelProps> = ({
         setMessages(prev => {
           const newMessages = [...prev];
           newMessages[newMessages.length - 1] = {
+            ...newMessages[newMessages.length - 1],
             role: 'assistant',
             content: buildErrorMessage(error),
+            wireExcluded: true,
+            wireBlocked: error.name === 'ChatHistoryError',
           };
           return newMessages;
         });
@@ -1193,6 +1207,7 @@ const LLMChatPanel: React.FC<LLMChatPanelProps> = ({
   const handleEditMessage = (index: number, e: React.MouseEvent) => {
     if (isBusy) return;
     e.stopPropagation();
+    if (routerHistoryCommitted) { showError('Start a new chat to change earlier router messages.'); return; }
     const message = messages[index];
     if (message.role === 'user') {
       setEditingIndex(index);
@@ -1406,8 +1421,9 @@ const LLMChatPanel: React.FC<LLMChatPanelProps> = ({
                 </div>
               ) : (
                 <div
+                  title={message.role === 'user' && routerHistoryCommitted ? 'Start a new chat to change earlier router messages.' : undefined}
                   onClick={(e) => message.role === 'user' && !isBusy && handleEditMessage(index, e)}
-                  style={{ cursor: message.role === 'user' && !isBusy ? 'pointer' : 'default' }}
+                  style={{ cursor: message.role === 'user' && !isBusy && !routerHistoryCommitted ? 'pointer' : 'default' }}
                 >
                   {renderMessageContent(message.content, message.thinking, index, message.role === 'assistant', message.role)}
                 </div>

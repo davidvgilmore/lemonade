@@ -56,6 +56,10 @@ require.extensions['.ts'] = function loadTypeScript(module, filename) {
   module._compile(output, filename);
 };
 
+const { appendChatDelta, chatHistoryMessage } = require(path.join(appRoot, 'src', 'renderer', 'utils', 'chatWireMessage.ts'));
+const { chatResponseError } = require(path.join(appRoot, 'src', 'renderer', 'utils', 'chatResponseError.ts'));
+const { createChatRequestIdentity } = require(path.join(appRoot, 'src', 'renderer', 'utils', 'chatRequestIdentity.ts'));
+
 const collectionUtils = require(
   path.join(appRoot, 'src', 'renderer', 'utils', 'customCollections.ts'),
 );
@@ -1473,4 +1477,87 @@ const tests = [
 
 ];
 
+tests.push({
+  name: 'ARC setup round-trip preserves action controls and rejects broken candidate bindings',
+  run() {
+    const action = 'a'.repeat(64);
+    const routing = {
+      candidates: ['Model-A'], default_model: 'Model-A',
+      router: { type: 'arc', endpoint: 'http://127.0.0.1:9011/v1/rayline/arc/policy/decide',
+        package: { alias: 'synthetic', package_sha256: 'b'.repeat(64) },
+        actions: { [action]: { model: 'Model-A', reasoning_effort: null, reasoning_max_tokens: null, steering_suffix: 'synthetic instruction' } } },
+    };
+    const draft = parse('user.Arc', routing, ['Model-A']);
+    assert.equal(draft.routingMode, 'arc');
+    assert.equal(collectionUtils.validateRouterDraftStructure(draft), null);
+    assert.deepEqual(build(draft).routing, routing);
+    assert.deepEqual(validateImport(build(draft)).routing, routing);
+    const changed = { ...draft, candidates: ['Model-B'], defaultModel: 'Model-B' };
+    assert.match(collectionUtils.validateRouterDraftStructure(changed), /selected candidate/);
+    assert.throws(() => build(changed), /selected candidate/);
+    assert.match(collectionUtils.validateRouterDraftStructure({ ...draft, arcRouter: { ...draft.arcRouter, endpoint: 'https://external.example/decide' } }), /local endpoint/);
+  },
+});
+tests.push({
+  name: 'chat identity scopes concurrent conversations and creates a new request ID per attempt',
+  run() {
+    let counter = 0;
+    const makeId = () => String(++counter);
+    const first = createChatRequestIdentity(makeId);
+    const second = createChatRequestIdentity(makeId);
+    const a = first(), b = first(), c = second();
+    assert.equal(a['X-Client-Session-Id'], b['X-Client-Session-Id']);
+    assert.notEqual(a['X-Lemonade-Request-Id'], b['X-Lemonade-Request-Id']);
+    assert.notEqual(a['X-Client-Session-Id'], c['X-Client-Session-Id']);
+    const reset = createChatRequestIdentity(makeId)();
+    assert.notEqual(a['X-Client-Session-Id'], reset['X-Client-Session-Id']);
+  },
+});
+tests.push({
+  name: 'streamed assistant reasoning and tool identity survive display projection and history replay',
+  run: () => {
+    const wire = { role: 'assistant', content: '' };
+    appendChatDelta(wire, { content: '<think>Plan</think>', reasoning: 'Think ', reasoning_details: [{ index: 0, type: 'reasoning.text', text: 'Think ', signature: 'sig-' }], tool_calls: [{ index: 0, id: 'call-1', type: 'function', function: { name: 'lookup', arguments: '{"q":' } }] });
+    appendChatDelta(wire, { content: 'Visible answer', reasoning: 'carefully.', reasoning_details: [{ index: 0, type: 'reasoning.text', text: 'carefully.', signature: 'end' }], tool_calls: [{ index: 0, function: { arguments: '"x"}' } }] });
+    const display = { role: 'assistant', content: 'Visible answer', thinking: 'UI-only', wireMessage: wire };
+    assert.deepEqual(chatHistoryMessage(display), { role: 'assistant', content: '<think>Plan</think>Visible answer', reasoning: 'Think carefully.', reasoning_details: [{ index: 0, type: 'reasoning.text', text: 'Think carefully.', signature: 'sig-end' }], tool_calls: [{ id: 'call-1', type: 'function', function: { name: 'lookup', arguments: '{"q":"x"}' } }] });
+    assert.deepEqual(chatHistoryMessage({ role: 'assistant', content: 'Legacy', thinking: 'UI-only' }), { role: 'assistant', content: 'Legacy' });
+  },
+});
+tests.push({
+  name: 'native ARC session setup round-trips without diagnostic endpoint and refuses malformed sessions',
+  run() {
+    const action = 'a'.repeat(64);
+    const routing = { candidates: ['Model-A'], default_model: 'Model-A', router: {
+      type: 'arc', package: { alias: 'synthetic', package_sha256: 'b'.repeat(64) },
+      session: { endpoint: 'http://127.0.0.1:9011/experimental/arc/session', owner_id: 'owner', codec_sha256: 'd'.repeat(64) },
+      actions: { [action]: { model: 'Model-A', wire_model: 'provider/model', reasoning_effort: null, reasoning_max_tokens: 128, steering_suffix: 'private instruction' } },
+    } };
+    const draft = parse('user.Arc', routing, ['Model-A']);
+    assert.equal(collectionUtils.validateRouterDraftStructure(draft), null);
+    assert.deepEqual(build(draft).routing, routing);
+    const saved = build({ ...draft, name: 'Renamed' });
+    assert.equal(saved.model_name, 'user.Arc', 'editing preserves the existing router identity');
+    assert.deepEqual(validateImport(saved).routing, routing);
+    assert.equal(build({ ...draft, id: undefined, name: 'NewArc' }).model_name, 'user.NewArc');
+    for (const session of [null, {}, { ...routing.router.session, endpoint: 'https://external.example/session' }, { ...routing.router.session, owner_id: '' }, { ...routing.router.session, owner_id: 'é'.repeat(129) }, { ...routing.router.session, codec_sha256: 'bad' }]) {
+      const changed = { ...draft, arcRouter: { ...draft.arcRouter, endpoint: 'http://127.0.0.1:9011/v1/rayline/arc/policy/decide', session } };
+      assert.match(collectionUtils.validateRouterDraftStructure(changed), /ARC session/);
+      assert.throws(() => build(changed), /ARC session/);
+    }
+    for (const mutation of [{ wire_model: '' }, { reasoning_effort: 1 }, { reasoning_max_tokens: -1 }, { steering_suffix: null }]) {
+      const changed = { ...draft, arcRouter: { ...draft.arcRouter, actions: { [action]: { ...routing.router.actions[action], ...mutation } } } };
+      assert.notEqual(collectionUtils.validateRouterDraftStructure(changed), null);
+    }
+  },
+});
+tests.push({
+  name: 'chat refusal keeps actionable session errors and falls back for missing error detail',
+  async run() {
+    assert.match((await chatResponseError({ status: 503, json: async () => ({ error: 'ARC session runtime is unavailable' }) })).message, /ARC session runtime is unavailable/);
+    assert.match((await chatResponseError({ status: 409, json: async () => ({ error: { message: 'Settlement uncertain' } }) })).message, /Settlement uncertain/);
+    assert.equal((await chatResponseError({ status: 500, json: async () => ({}) })).message, 'HTTP error! status: 500');
+    assert.equal((await chatResponseError({ status: 502, json: async () => { throw Error('not JSON'); } })).message, 'HTTP error! status: 502');
+  },
+});
 module.exports = { tests };

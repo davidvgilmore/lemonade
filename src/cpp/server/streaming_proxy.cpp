@@ -1,3 +1,4 @@
+#include "lemon/prepared_request.h"
 #include "lemon/streaming_proxy.h"
 #include <sstream>
 #include <iostream>
@@ -214,7 +215,7 @@ void StreamingProxy::forward_sse_stream(
                 return false;
             }
 
-            return true;
+            return !PreparedRequestScope::terminal_delivered();
         },
         {},
         timeout_seconds,
@@ -245,6 +246,9 @@ void StreamingProxy::forward_sse_stream(
     // A CR held back as a possible split CRLF terminates its line once no more
     // bytes can arrive, so the last event of a CR-terminated stream still counts.
     process_sse_lines(line_buffer, process_line, true);
+
+    if (result.curl_code == CURLE_WRITE_ERROR && result.status_code == 200 &&
+        PreparedRequestScope::terminal_delivered()) result.curl_code = CURLE_OK;
 
     const bool client_disconnected =
         result.curl_code == CURLE_WRITE_ERROR ||
@@ -333,7 +337,7 @@ void StreamingProxy::forward_sse_stream(
         // Ensure [DONE] marker is sent only for clean transports. If the transport
         // was interrupted before [DONE], the block above throws and recovery is
         // handled by WrappedServer/Router instead of pretending success.
-        if (!has_done_marker) {
+        if (!has_done_marker && !PreparedRequestScope::current()) {
             LOG(WARNING, "StreamingProxy") << "WARNING: Backend did not send [DONE] marker, adding it" << std::endl;
             const char* done_marker = "data: [DONE]\n\n";
             sink.write(done_marker, strlen(done_marker));

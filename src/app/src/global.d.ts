@@ -59,6 +59,7 @@ declare global {
       discoverServerPort?: () => Promise<number | null>;
       getServerPort?: () => Promise<number>;
       // Returns the configured server base URL or null if using localhost discovery
+      getFixedServerUrl?: () => Promise<string | null>;
       getServerBaseUrl?: () => Promise<string | null>;
       getServerAPIKey?: () => Promise<string | null>;
       onServerPortUpdated?: (callback: (port: number) => void) => void | (() => void);

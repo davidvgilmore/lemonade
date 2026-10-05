@@ -94,6 +94,9 @@ mod imp {
 /// kill-and-wait loop can block for up to 30 seconds, which would freeze the
 /// Tauri main thread if we called it synchronously from `setup()`.
 pub(crate) fn ensure_tray_running() {
+    if crate::profile::current().is_some() {
+        return;
+    }
     #[cfg(target_os = "macos")]
     {
         std::thread::spawn(imp::spawn);

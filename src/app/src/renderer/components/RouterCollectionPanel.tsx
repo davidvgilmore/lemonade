@@ -12,12 +12,14 @@ import {
   makeCollectionId,
   routingToRouterCollectionDraft,
   validateRouterDraftStructure,
+  validateRouterImportPayload,
 } from '../utils/customCollections';
 import { isCollectionRecipe } from '../utils/recipeNames';
 import { isLeaf, isOperatorNode, makeDefaultLeaf, SIGNAL_COLORS, type ConditionSignalType } from '../utils/routerTree';
 import type { RoutingPolicyDoc } from '../utils/decisionTree';
 import RouterPipelineCanvas from './RouterPipelineCanvas';
 import RouterTestPromptPanel from './RouterTestPromptPanel';
+import ArcRouterTestPanel from './ArcRouterTestPanel';
 import { ModelCheckboxList, ModelSelect, type ModelOption } from './ModelSearchPicker';
 import Tabs from '../Tabs';
 import { useTabsContext } from '../TabsContext';
@@ -814,8 +816,12 @@ const RouterCollectionPanel: React.FC<RouterCollectionPanelProps> = ({
           <label className="form-label">Router Name *</label>
           <input type="text" className="form-input"
             value={draft.name}
+            readOnly={mode === 'edit'}
             onChange={e => patch({ name: e.target.value.replace(/^user\./, '') })}
             placeholder="MyHybridRouter" />
+          {mode === 'edit' && (
+            <p className="settings-description">The name identifies this saved router and cannot be changed. Create a new router to use a different name.</p>
+          )}
           {draft.name.trim() && (
             <span className="settings-description" style={{ display: 'block', marginTop: 3, fontFamily: 'monospace', fontSize: '0.7rem' }}>
               ID: {makeCollectionId(draft.name)}
@@ -854,7 +860,7 @@ const RouterCollectionPanel: React.FC<RouterCollectionPanelProps> = ({
         <div className="form-section">
           <label className="form-label">
             Default Model *
-            <span className="settings-description" style={{ marginLeft: 6 }}>- fallback when no rule matches</span>
+            <span className="settings-description" style={{ marginLeft: 6 }}>{draft.routingMode === 'arc' ? '- required collection setting; ARC errors stop the request' : '- fallback when no rule matches'}</span>
           </label>
           <ModelSelect
             options={draft.candidates.map(id => ({ id, label: displayName(id) }))}
@@ -868,6 +874,11 @@ const RouterCollectionPanel: React.FC<RouterCollectionPanelProps> = ({
         <div className="form-section">
           <label className="form-label">Routing Mode</label>
           <div className="router-mode-options">
+            <label className={`router-mode-option${draft.routingMode === 'arc' ? ' router-mode-option--selected' : ''}`}>
+              <input type="radio" name="routingMode" value="arc" checked={draft.routingMode === 'arc'} onChange={() => patch({ routingMode: 'arc' })} />
+              <strong>ARC</strong>
+              <span className="settings-description">Use a local ARC model to select a destination.</span>
+            </label>
             <label className={`router-mode-option${draft.routingMode === 'llm' ? ' router-mode-option--selected' : ''}`}>
               <input type="radio" name="routingMode" value="llm" checked={draft.routingMode === 'llm'}
                 onChange={() => {
@@ -920,6 +931,27 @@ const RouterCollectionPanel: React.FC<RouterCollectionPanelProps> = ({
           </div>
         </div>
 
+        {draft.routingMode === 'arc' && (
+          <div className="form-section">
+            <label className="form-label">ARC Setup</label>
+            <p className="settings-description">Import the router setup supplied by your local ARC runtime. Keep private access tokens in the runtime environment, outside this file.</p>
+            <input type="file" accept=".json,application/json" aria-label="Import ARC setup" onChange={async e => {
+              const file = e.target.files?.[0];
+              e.target.value = '';
+              if (!file) return;
+              try {
+                const payload = validateRouterImportPayload(JSON.parse(await file.text()));
+                const imported = routingToRouterCollectionDraft(String(payload.model_name), payload.routing as Record<string, unknown>, []);
+                if (imported.routingMode !== 'arc') throw new Error('Choose an ARC router setup file.');
+                const error = validateRouterDraftStructure(imported);
+                if (error) throw new Error(error);
+                patch({ arcRouter: imported.arcRouter, candidates: imported.candidates, defaultModel: imported.defaultModel });
+              } catch (error) { showError(error instanceof Error ? error.message : 'Could not import ARC setup.'); }
+            }} />
+            {draft.arcRouter && <p className="settings-description">Package: {draft.arcRouter.package?.alias}. {Object.keys(draft.arcRouter.actions ?? {}).length} configured actions.</p>}
+            <p className="settings-description">{draft.arcRouter?.session ? 'Save this router, select it in Chat, and send a message. The local ARC session runtime routes each turn and manages private steering.' : 'This diagnostic setup tests saved conversations. Import a session setup from your local ARC runtime to use ordinary Chat.'}</p>
+          </div>
+        )}
         {draft.routingMode === 'llm' && (
           <>
             <div className="form-section">
@@ -1008,7 +1040,13 @@ const RouterCollectionPanel: React.FC<RouterCollectionPanelProps> = ({
         </div>
       )}
           </>}
-          testPrompt={
+          testPrompt={draft.routingMode === 'arc' && draft.arcRouter?.session ?
+            <div className="settings-content custom-collection-content"><div className="form-section">
+              <label className="form-label">Try this router in Chat</label>
+              <p className="settings-description">Save this router, select it in Chat, and send a message. Conversation context is supplied automatically by this app.</p>
+              {testUnavailableReason && <p role="status">{testUnavailableReason}</p>}
+            </div></div> : draft.routingMode === 'arc' ?
+            <ArcRouterTestPanel policy={testPolicy} unavailableReason={testUnavailableReason} /> :
             <RouterTestPromptPanel
               policy={testPolicy}
               policyUnavailableReason={testUnavailableReason}
