@@ -33,7 +33,7 @@ require.extensions['.ts'] = function loadTypeScript(module, filename) {
 };
 
 const appSettingsPath = path.join(appRoot, 'src', 'renderer', 'utils', 'appSettings.ts');
-const { mergeWithDefaultSettings } = require(appSettingsPath);
+const { mergeWithDefaultSettings, createDefaultSettings, cloneSettings, buildChatRequestOverrides, clampNumericSettingValue } = require(appSettingsPath);
 
 if (originalTsLoader) {
   require.extensions['.ts'] = originalTsLoader;
@@ -78,6 +78,31 @@ defineTest('mergeWithDefaultSettings rejects removed prompt-debugger leftPanelVi
   });
 
   assert.equal(settings.layout.leftPanelView, 'models');
+});
+
+defineTest('output cap defaults remain omitted for new and older settings', () => {
+  assert.equal(buildChatRequestOverrides(createDefaultSettings()).max_completion_tokens, undefined);
+  assert.equal(buildChatRequestOverrides(mergeWithDefaultSettings({ temperature: { value: 0.5, useDefault: false } })).max_completion_tokens, undefined);
+});
+
+defineTest('explicit output cap survives persistence and clone without changing thinking', () => {
+  const settings = mergeWithDefaultSettings({ maxOutputTokens: { value: 512, useDefault: false } });
+  const restored = mergeWithDefaultSettings(JSON.parse(JSON.stringify(settings)));
+  const copied = cloneSettings(restored);
+  assert.deepEqual(buildChatRequestOverrides(copied), { max_completion_tokens: 512 });
+  copied.maxOutputTokens.value = 128;
+  assert.equal(restored.maxOutputTokens.value, 512);
+  copied.maxOutputTokens.useDefault = true;
+  assert.equal(buildChatRequestOverrides(copied).max_completion_tokens, undefined);
+});
+
+defineTest('output cap is always a bounded positive integer', () => {
+  for (const value of [0, -1, 1.4, 511.8, Infinity, NaN, 2 ** 40]) {
+    const n = clampNumericSettingValue('maxOutputTokens', value);
+    assert.ok(Number.isInteger(n) && n >= 1 && n <= 1048576);
+    const settings = mergeWithDefaultSettings({ maxOutputTokens: { value, useDefault: false } });
+    assert.equal(buildChatRequestOverrides(settings).max_completion_tokens, n);
+  }
 });
 
 let failures = 0;

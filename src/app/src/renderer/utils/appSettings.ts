@@ -1,4 +1,4 @@
-export type NumericSettingKey = 'temperature' | 'topK' | 'topP' | 'repeatPenalty';
+export type NumericSettingKey = 'temperature' | 'topK' | 'topP' | 'repeatPenalty' | 'maxOutputTokens';
 export type BooleanSettingKey = 'enableThinking' | 'collapseThinkingByDefault';
 export type StringSettingKey = 'baseURL' | 'apiKey';
 export type SettingKey = NumericSettingKey | BooleanSettingKey | StringSettingKey;
@@ -48,6 +48,7 @@ export interface AppSettings {
   topK: NumericSetting;
   topP: NumericSetting;
   repeatPenalty: NumericSetting;
+  maxOutputTokens: NumericSetting;
   enableThinking: BooleanSetting;
   collapseThinkingByDefault: BooleanSetting;
   baseURL: StringSetting;
@@ -69,6 +70,7 @@ export const BASE_SETTING_VALUES: BaseSettingValues = {
   topK: 40,
   topP: 0.9,
   repeatPenalty: 1.1,
+  maxOutputTokens: 4096,
   enableThinking: true,
   collapseThinkingByDefault: false,
   baseURL: '',
@@ -80,9 +82,10 @@ export const NUMERIC_SETTING_LIMITS: Record<NumericSettingKey, { min: number; ma
   topK: { min: 1, max: 100, step: 1 },
   topP: { min: 0, max: 1, step: 0.01 },
   repeatPenalty: { min: 1, max: 2, step: 0.1 },
+  maxOutputTokens: { min: 1, max: 1048576, step: 1 },
 };
 
-const numericSettingKeys: NumericSettingKey[] = ['temperature', 'topK', 'topP', 'repeatPenalty'];
+const numericSettingKeys: NumericSettingKey[] = ['temperature', 'topK', 'topP', 'repeatPenalty', 'maxOutputTokens'];
 
 export const DEFAULT_LAYOUT_SETTINGS: LayoutSettings = {
   theme: 'dark',
@@ -114,6 +117,7 @@ export const createDefaultSettings = (): AppSettings => ({
   topK: { value: BASE_SETTING_VALUES.topK, useDefault: true },
   topP: { value: BASE_SETTING_VALUES.topP, useDefault: true },
   repeatPenalty: { value: BASE_SETTING_VALUES.repeatPenalty, useDefault: true },
+  maxOutputTokens: { value: BASE_SETTING_VALUES.maxOutputTokens, useDefault: true },
   enableThinking: { value: BASE_SETTING_VALUES.enableThinking, useDefault: true },
   collapseThinkingByDefault: { value: BASE_SETTING_VALUES.collapseThinkingByDefault, useDefault: true },
   baseURL: { value: BASE_SETTING_VALUES.baseURL, useDefault: true },
@@ -128,6 +132,7 @@ export const cloneSettings = (settings: AppSettings): AppSettings => ({
   topK: { ...settings.topK },
   topP: { ...settings.topP },
   repeatPenalty: { ...settings.repeatPenalty },
+  maxOutputTokens: { ...settings.maxOutputTokens },
   enableThinking: { ...settings.enableThinking },
   collapseThinkingByDefault: { ...settings.collapseThinkingByDefault },
   baseURL: { ...settings.baseURL },
@@ -144,7 +149,8 @@ export const clampNumericSettingValue = (key: NumericSettingKey, value: number):
     return BASE_SETTING_VALUES[key];
   }
 
-  return Math.min(Math.max(value, min), max);
+  const bounded = Math.min(Math.max(value, min), max);
+  return key === 'maxOutputTokens' ? Math.round(bounded) : bounded;
 };
 
 export const mergeWithDefaultSettings = (incoming?: Partial<AppSettings>): AppSettings => {
@@ -324,6 +330,10 @@ export const buildChatRequestOverrides = (settings?: AppSettings | null): Record
 
   if (!settings.repeatPenalty.useDefault) {
     overrides.repeat_penalty = Number(settings.repeatPenalty.value.toFixed(4));
+  }
+
+  if (!settings.maxOutputTokens.useDefault) {
+    overrides.max_completion_tokens = clampNumericSettingValue('maxOutputTokens', settings.maxOutputTokens.value);
   }
 
   if (!settings.enableThinking.useDefault) {

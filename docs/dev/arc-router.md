@@ -128,6 +128,13 @@ and exporting retains the complete action bindings, including controls that are
 only supported for decision testing. A changed candidate selection must still
 contain every bound destination.
 
+In desktop or browser **Settings → LLM**, **Maximum Output Tokens** optionally
+limits each Chat response. **Auto** omits the cap and leaves the server or
+provider default in effect. For a bounded example, enter `512` and save before
+sending a prompt. Reset restores Auto. This client setting sends the standard
+Chat `max_completion_tokens` field; it does not set model-specific thinking
+controls or change ARC's selected action.
+
 The **Test Prompt** tab accepts a saved ARC decision request and tests it against
 the local runtime. The result is a selected destination, without a downstream
 model call. This checks connectivity and the supplied conversation; it does not
