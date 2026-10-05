@@ -253,6 +253,18 @@ qualify an ARC checkpoint or the session service's own policy/ledger math.
 
 The same session collection and identity headers work with `/v1/messages` when
 it has registered cloud candidates whose provider `wire_format` is `anthropic`.
+For ordinary Claude clients, Messages sessions also accept
+`X-Claude-Code-Session-Id` or a JSON-encoded `metadata.user_id` containing a
+nonempty string `session_id`. If both native forms are present, they must agree.
+The explicit `X-Client-Session-Id` remains authoritative. Anonymous or malformed
+native session identity is refused before preparation.
+
+`X-Lemonade-Request-Id` remains authoritative for the operation. Otherwise,
+Lemonade preserves `X-Client-Request-Id`, or generates one ID for that incoming
+HTTP request when neither is supplied. Generated IDs do not deduplicate retries
+across separate HTTP requests. A client that needs retry identity must preserve
+its explicit request ID. The browser Chat identity contract is unchanged.
+
 Lemonade passes the full configured action list to the service. A collection
 with no native candidate fails before preparation; if the selected winner lacks
 native transport, Lemonade aborts that receipt and refuses dispatch. It does not

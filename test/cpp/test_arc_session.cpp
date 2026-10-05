@@ -12,12 +12,71 @@ static void require(bool condition) {
     if (!condition) throw std::runtime_error("ARC session contract assertion failed");
 }
 
+static void test_native_identity() {
+    std::map<std::string, std::string> headers;
+    const auto header = [&](const char* name) -> std::optional<std::string> {
+        const auto found = headers.find(name);
+        if (found == headers.end()) return std::nullopt;
+        return found->second;
+    };
+    int generated = 0;
+    const auto generate = [&] { return "request-" + std::to_string(++generated); };
+    const json native = {{"metadata", {{"user_id", R"({"session_id":"claude-session"})"}}}};
+    const auto first = arc_messages_identity(header, native, generate);
+    const auto second = arc_messages_identity(header, native, generate);
+    require(first.session_id == "claude-session" && second.session_id == first.session_id);
+    require(first.operation_id == "request-1" && second.operation_id == "request-2");
+    headers["X-Client-Request-Id"] = "native-request";
+    require(arc_messages_identity(header, native, generate).operation_id == "native-request" && generated == 2);
+    headers["X-Claude-Code-Session-Id"] = "claude-session";
+    require(arc_messages_identity(header, native, generate).session_id == "claude-session");
+    headers["X-Claude-Code-Session-Id"] = "different-session";
+    bool conflict = false;
+    try { arc_messages_identity(header, native, generate); } catch (const ArcRoutingError&) { conflict = true; }
+    require(conflict);
+    headers["X-Client-Session-Id"] = "explicit-session";
+    headers["X-Lemonade-Request-Id"] = "explicit-request";
+    const auto explicit_identity = arc_messages_identity(header, native, generate);
+    require(explicit_identity.session_id == "explicit-session" && explicit_identity.operation_id == "explicit-request");
+    require(arc_messages_identity(header, {{"metadata", {{"user_id", "invalid"}}}}, generate).session_id == "explicit-session");
+    headers.clear();
+    for (const auto& request : std::vector<json>{json::object(),
+            {{"metadata", nullptr}}, {{"metadata", {{"user_id", "invalid"}}}},
+            {{"metadata", {{"user_id", "{}"}}}}, {{"metadata", {{"user_id", R"({"session_id":4})"}}}},
+            {{"metadata", {{"user_id", R"({"session_id":""})"}}}},
+            {{"metadata", {{"user_id", json({{"session_id", std::string(257, 'x')}}).dump()}}}}}) {
+        bool refused = false;
+        try { arc_messages_identity(header, request, generate); } catch (const ArcRoutingError&) { refused = true; }
+        require(refused);
+    }
+    for (const auto* key : {"X-Client-Session-Id", "X-Claude-Code-Session-Id", "X-Lemonade-Request-Id", "X-Client-Request-Id"}) {
+        for (const auto& value : {std::string(), std::string("bad value"), std::string(257, 'x')}) {
+            headers = {{key, value}};
+            bool refused = false;
+            try { arc_messages_identity(header, native, generate); } catch (const ArcRoutingError&) { refused = true; }
+            require(refused);
+        }
+    }
+    require(arc_native_operation_id() != arc_native_operation_id());
+}
+
 int main() {
+    test_native_identity();
     const std::string action(64, 'a'), pin(64, 'b');
     const json config = {{"package", {{"alias", "fixture"}, {"package_sha256", pin}}},
                          {"actions", {{action, {{"wire_model", "native-model"}}}}}};
     const ArcSessionConfig session{"http://127.0.0.1:9/session", "owner", pin};
     const json source = {{"messages", json::array()}, {"model", "router"}, {"stream", false}};
+    const auto native_identity = arc_messages_identity(
+        [](const char*) -> std::optional<std::string> { return std::nullopt; },
+        {{"metadata", {{"user_id", R"({"session_id":"native-scope"})"}}}},
+        [] { return "native-operation"; });
+    const auto native_payload = arc_session_prepare_payload(config, session, native_identity, source, "anthropic_messages");
+    require(native_payload.at("metadata").at("session_id") == "native-scope");
+    require(native_payload.at("operation_id") == "native-operation" && native_payload.at("request") == source);
+    const auto browser_payload = arc_session_prepare_payload(config, session, {"browser-scope", "browser-operation"}, source);
+    require(browser_payload.at("metadata").at("session_id") == "browser-scope" &&
+            browser_payload.at("operation_id") == "browser-operation" && browser_payload.at("request_format") == "openai_chat");
     json receipt = {{"owner_id", "owner"}, {"package_sha256", pin},
         {"source_request_format", "openai_chat"}, {"request_format", "anthropic_messages"},
         {"response_codec", {{"schema_version", "rayline.arc.response-codec.v1"},

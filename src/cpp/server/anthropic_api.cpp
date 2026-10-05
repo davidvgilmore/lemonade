@@ -911,9 +911,12 @@ void OllamaApi::handle_anthropic_messages(const httplib::Request& req, httplib::
                               registry->wire_format_for(candidate.cloud_provider) == "openai")))) has_native_candidate = true;
                     }
                     arc_require(has_native_candidate, "ARC collection has no native Anthropic Messages candidates");
+                    const auto identity = arc_messages_identity([&req](const char* name) -> std::optional<std::string> {
+                        if (!req.has_header(name)) return std::nullopt;
+                        return req.get_header_value(name);
+                    }, request_json);
                     auto prepared = prepare_arc_session(config, *info.route_policy->arc_session,
-                        {req.get_header_value("X-Client-Session-Id"), req.get_header_value("X-Lemonade-Request-Id")},
-                        request_json, "anthropic_messages", req.is_connection_closed);
+                        identity, request_json, "anthropic_messages", req.is_connection_closed);
                     const auto action = prepared->receipt().at("action_id").get<std::string>();
                     const auto selected = config.at("actions").at(action).at("model").get<std::string>();
                     if (prepared->receipt().at("request_format") == "openai_chat") {

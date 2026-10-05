@@ -2,14 +2,18 @@
 
 #include "lemon/arc_router.h"
 
+#include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
+#include <cstdint>
 #include <functional>
 #include <iostream>
 #include <map>
 #include <memory>
 #include <mutex>
+#include <optional>
+#include <random>
 #include <string>
 
 namespace lemon {
@@ -32,6 +36,63 @@ struct ArcSessionIdentity {
     std::string session_id;
     std::string operation_id;
 };
+
+inline std::string arc_native_operation_id() {
+    static const std::string incarnation = [] {
+        std::random_device random;
+        std::string value;
+        const char* hex = "0123456789abcdef";
+        for (int i = 0; i < 32; ++i) value += hex[random() & 15];
+        return value;
+    }();
+    static std::atomic<uint64_t> sequence{0};
+    return "messages_" + incarnation + "_" + std::to_string(++sequence);
+}
+
+inline ArcSessionIdentity arc_messages_identity(
+        const std::function<std::optional<std::string>(const char*)>& header,
+        const json& request,
+        const std::function<std::string()>& new_operation = arc_native_operation_id) {
+    const auto checked = [](const std::string& value) {
+        arc_require(!value.empty() && value.size() <= 256 &&
+            std::none_of(value.begin(), value.end(), [](unsigned char c) { return c <= 32 || c == 127; }),
+            "ARC native identity must be nonempty, at most 256 bytes, and contain no whitespace or controls");
+        return value;
+    };
+    ArcSessionIdentity identity;
+    if (const auto explicit_session = header("X-Client-Session-Id")) {
+        identity.session_id = checked(*explicit_session);
+    } else {
+        std::optional<std::string> metadata_session;
+        if (request.contains("metadata")) {
+            const auto& metadata = request.at("metadata");
+            arc_require(metadata.is_object(), "ARC native metadata must be an object");
+            if (metadata.contains("user_id")) {
+                arc_require(metadata.at("user_id").is_string(), "ARC native metadata.user_id must encode a JSON object");
+                const auto user = json::parse(metadata.at("user_id").get<std::string>(), nullptr, false);
+                arc_require(user.is_object() && user.contains("session_id") && user.at("session_id").is_string(),
+                    "ARC native metadata.user_id requires a string session_id");
+                metadata_session = checked(user.at("session_id").get<std::string>());
+            }
+        }
+        const auto native_session = header("X-Claude-Code-Session-Id");
+        if (native_session) identity.session_id = checked(*native_session);
+        if (metadata_session) {
+            arc_require(!native_session || *native_session == *metadata_session,
+                "ARC native session identities conflict");
+            identity.session_id = *metadata_session;
+        }
+        arc_require(!identity.session_id.empty(), "ARC Messages requires an explicit or native Claude session identity");
+    }
+    if (const auto explicit_operation = header("X-Lemonade-Request-Id")) {
+        identity.operation_id = checked(*explicit_operation);
+    } else if (const auto native_operation = header("X-Client-Request-Id")) {
+        identity.operation_id = checked(*native_operation);
+    } else {
+        identity.operation_id = checked(new_operation());
+    }
+    return identity;
+}
 
 class ArcSessionLease {
     struct State {
