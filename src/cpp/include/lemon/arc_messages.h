@@ -28,7 +28,19 @@ public:
             if (!line.empty() && line.back() == '\r') line.pop_back();
             if (line.empty()) {
                 if (!event_data_.empty()) {
-                    try { event(json::parse(event_data_)); }
+                    try {
+                        const auto first = event_data_.find_first_not_of(" \t\r\n");
+                        const auto last = event_data_.find_last_not_of(" \t\r\n");
+                        const auto payload = first == std::string::npos ? std::string() :
+                            event_data_.substr(first, last - first + 1);
+                        if (payload == "[DONE]") {
+                            if (!terminal() || done_) valid_ = false;
+                            else done_ = true;
+                        } else {
+                            if (done_) valid_ = false;
+                            else event(json::parse(event_data_));
+                        }
+                    }
                     catch (...) { valid_ = false; }
                     event_data_.clear();
                 }
@@ -105,7 +117,7 @@ private:
     std::string buffer_;
     std::string event_data_;
     size_t bytes_ = 0;
-    bool valid_ = true, known_ = true, started_ = false, finished_ = false, stopped_ = false;
+    bool valid_ = true, known_ = true, started_ = false, finished_ = false, stopped_ = false, done_ = false;
     std::map<int, json> blocks_;
     std::map<int, std::string> input_;
     std::set<int> open_;

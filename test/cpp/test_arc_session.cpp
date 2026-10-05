@@ -176,6 +176,31 @@ int main() {
     require(native.accept("\n", 1) && native.terminal());
     require(native.messages().at(0).at("content").at(0).at("data") == "opaque");
 
+    // Some native providers append a transport sentinel after message_stop.
+    // The same native history must survive coalesced and fragmented chunks.
+    const std::string native_complete_frames = native_events + "\n";
+    const std::string native_done = "event: data\ndata: [DONE]\n\n";
+    const std::string with_done = native_complete_frames + native_done;
+    ArcMessagesStream coalesced;
+    require(coalesced.accept(with_done.data(), with_done.size()) && coalesced.terminal());
+    require(coalesced.messages() == native.messages());
+    ArcMessagesStream fragmented;
+    for (const char byte : with_done) require(fragmented.accept(&byte, 1));
+    require(fragmented.terminal() && fragmented.messages() == native.messages());
+    ArcMessagesStream split;
+    require(split.accept(native_complete_frames.data(), native_complete_frames.size()) && split.terminal());
+    require(split.accept(native_done.data(), native_done.size()) && split.terminal());
+    require(!split.accept(native_done.data(), native_done.size()) && !split.terminal());
+    ArcMessagesStream native_early;
+    require(!native_early.accept(native_done.data(), native_done.size()) && !native_early.terminal());
+    ArcMessagesStream truncated_native;
+    const auto stop_at = native_complete_frames.rfind("data: {\"type\":\"message_stop\"}");
+    const auto without_stop = native_complete_frames.substr(0, stop_at) + native_done;
+    require(!truncated_native.accept(without_stop.data(), without_stop.size()));
+    ArcMessagesStream native_trailing;
+    const std::string after_done = with_done + "data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"}}\n\n";
+    require(!native_trailing.accept(after_done.data(), after_done.size()) && !native_trailing.terminal());
+
     std::vector<std::string> operations;
     auto settle = [&operations](const std::string& path, const json& body) {
         require(body.at("owner_id") == "host");
