@@ -3164,6 +3164,13 @@ if(BUILD_TESTING AND EXISTS "${_CONFIG_DEFAULT_SOURCE_TEST_SRC}")
     add_cpp_ci_test(ConfigDefaultSourceTest CI ON COMMAND test_config_default_source)
 endif()
 
+set(_AGENT_LAUNCHER_TEST_SRC "${CMAKE_CURRENT_SOURCE_DIR}/test/cpp/test_agent_launcher.cpp")
+if(BUILD_TESTING AND EXISTS "${_AGENT_LAUNCHER_TEST_SRC}")
+    add_executable(test_agent_launcher test/cpp/test_agent_launcher.cpp src/cpp/cli/agent_launcher.cpp)
+    target_link_libraries(test_agent_launcher PRIVATE lemonade-server-core)
+    add_cpp_ci_test(AgentLauncherTest CI ON COMMAND test_agent_launcher)
+endif()
+
 set(_CLI_RUNTIME_OVERRIDE_TEST_SRC "${CMAKE_CURRENT_SOURCE_DIR}/test/cpp/test_cli_runtime_override.cpp")
 if(BUILD_TESTING AND EXISTS "${_CLI_RUNTIME_OVERRIDE_TEST_SRC}")
     add_executable(test_cli_runtime_override test/cpp/test_cli_runtime_override.cpp)

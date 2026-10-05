@@ -86,3 +86,40 @@ For more launch examples and full option details, see:
 
 For Claude Code product details, see Anthropic's docs:
 https://code.claude.com/docs/en/overview
+
+## A fresh profile and an explicit context budget
+
+For a separate client profile, pass a **new absolute directory** whose parent
+already exists. Lemonade refuses to reuse an existing directory and leaves the
+profile on disk after Claude exits:
+
+```bash
+lemonade launch claude --model user.MyCloudRouter \
+  --fresh-profile /absolute/path/to/new-claude-profile \
+  --context-tokens 16384
+```
+
+Use an already configured cloud router when generation must stay in the cloud;
+these options do not change or install its backends. Normal model loading still
+occurs, so select the intended router explicitly rather than choosing a local
+model from the interactive menu. For the ARC cloud demo, only the small routing
+encoder and heads run locally; generation stays in the configured cloud
+providers. Do not load a local Qwen3.8-27B generator or configure a local
+generation fallback.
+
+`--fresh-profile` changes only the launched child's home, Claude configuration,
+platform configuration/cache and temporary directories. It disables the default
+Claude settings sources with `--setting-sources ""`; it does not edit your usual
+Claude or Ghostty configuration. This requires a Claude version supporting that
+flag. The working directory and tool permissions remain yours: a fresh profile
+is not a filesystem sandbox. Explicit `--agent-args` can still select settings or
+other client behavior. Claude may show first-run prompts in the new profile.
+
+`--context-tokens` sets `CLAUDE_CODE_MAX_CONTEXT_TOKENS` only for the launched
+process. Choose the budget supported by your deployment; 16384 above is an
+example, not a default for all routers. This does not resize the server's context
+or guarantee token equivalence between Claude and the routing encoder. Without
+the option, the existing environment and Claude defaults are unchanged. Custom
+model names may still produce an “unknown model” warning; the explicit budget
+provides the client override, not model-catalog registration. Automatic
+compaction at that limit has not been validated by this launcher change.

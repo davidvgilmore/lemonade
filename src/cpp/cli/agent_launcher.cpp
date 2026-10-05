@@ -2,8 +2,8 @@
 
 #include <lemon/utils/path_utils.h>
 
-#include <filesystem>
 #include <cstdlib>
+#include <filesystem>
 
 #ifndef _WIN32
 #include <unistd.h>
@@ -94,6 +94,7 @@ void append_codex_config_args(std::vector<std::string>& args,
 void configure_claude_agent(const std::string& base_url,
                             const std::string& model,
                             const std::string& api_key,
+                            const AgentLaunchOptions& options,
                             AgentConfig& config) {
     const std::string resolved_api_key = api_key.empty() ? kDefaultAgentApiKey : api_key;
 
@@ -127,6 +128,27 @@ void configure_claude_agent(const std::string& base_url,
         {"CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC", "1"}
     };
     config.extra_args = {};
+    if (options.claude_context_tokens > 0) {
+        config.env_vars.emplace_back("CLAUDE_CODE_MAX_CONTEXT_TOKENS", std::to_string(options.claude_context_tokens));
+    }
+    if (!options.claude_fresh_profile.empty()) {
+        const fs::path root(options.claude_fresh_profile);
+        config.env_vars.emplace_back("HOME", (root / "home").string());
+        config.env_vars.emplace_back("CLAUDE_CONFIG_DIR", (root / "claude").string());
+        config.env_vars.emplace_back("XDG_CONFIG_HOME", (root / "config").string());
+        config.env_vars.emplace_back("XDG_CACHE_HOME", (root / "cache").string());
+        config.env_vars.emplace_back("XDG_DATA_HOME", (root / "data").string());
+        config.env_vars.emplace_back("XDG_STATE_HOME", (root / "state").string());
+        for (const auto& name : {"TMPDIR", "TMP", "TEMP"}) {
+            config.env_vars.emplace_back(name, (root / "tmp").string());
+        }
+#ifdef _WIN32
+        config.env_vars.emplace_back("USERPROFILE", (root / "home").string());
+        config.env_vars.emplace_back("APPDATA", (root / "config").string());
+        config.env_vars.emplace_back("LOCALAPPDATA", (root / "cache").string());
+#endif
+        config.extra_args = {"--setting-sources", ""};
+    }
     config.install_instructions = "Install Claude Code CLI and ensure 'claude' is on PATH.";
 }
 
@@ -302,6 +324,51 @@ std::string build_agent_server_base_url(const std::string& host, int port) {
     return "http://" + host + ":" + std::to_string(port);
 }
 
+bool validate_claude_launch_options(const AgentLaunchOptions& options, std::string& error_message) {
+    if (options.claude_context_tokens < 0) {
+        error_message = "Claude context tokens must be positive when specified.";
+        return false;
+    }
+    if (!options.claude_fresh_profile.empty()) {
+        const fs::path root(options.claude_fresh_profile);
+        if (!root.is_absolute() || root == root.root_path()) {
+            error_message = "--fresh-profile requires a new absolute directory, not a filesystem root.";
+            return false;
+        }
+        for (const auto& part : root) {
+            if (part == "..") {
+                error_message = "--fresh-profile must not contain '..'.";
+                return false;
+            }
+        }
+    }
+    return true;
+}
+
+bool prepare_claude_profile(const AgentLaunchOptions& options, std::string& error_message) {
+    if (!validate_claude_launch_options(options, error_message)) return false;
+    if (options.claude_fresh_profile.empty()) return true;
+    const fs::path root(options.claude_fresh_profile);
+    std::error_code error;
+    if (!fs::create_directory(root, error)) {
+        error_message = "Cannot create fresh Claude profile; use a new directory with an existing parent: " + root.string();
+        if (error) error_message += " (" + error.message() + ")";
+        return false;
+    }
+    fs::permissions(root, fs::perms::owner_all, fs::perm_options::replace, error);
+    if (!error) {
+        for (const auto& name : {"home", "claude", "config", "cache", "data", "state", "tmp"}) {
+            fs::create_directory(root / name, error);
+            if (error) break;
+        }
+    }
+    if (error) {
+        error_message = "Fresh Claude profile initialization failed; partial directory retained: " + error.message();
+        return false;
+    }
+    return true;
+}
+
 bool agent_needs_config_sync(const std::string& agent) {
     return agent == "opencode" || agent == "pi" || agent == "junie";
 }
@@ -317,7 +384,8 @@ bool build_agent_config(const std::string& agent,
     const std::string base = build_agent_server_base_url(host, port);
 
     if (agent == "claude") {
-        configure_claude_agent(base, model, api_key, config);
+        if (!validate_claude_launch_options(launch_options, error_message)) return false;
+        configure_claude_agent(base, model, api_key, launch_options, config);
         return true;
     }
 
