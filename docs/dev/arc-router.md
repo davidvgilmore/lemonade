@@ -1,5 +1,9 @@
 # ARC policy worker integration (experimental)
 
+For ordinary private-kit setup, desktop use and fresh Claude profiles, see the
+[ARC routing integration preview](../integrations/arc-routing-preview.md). The
+replay envelopes below are adapter/developer contracts, not normal user setup.
+
 ARC is a decision policy, not a text generator. The `collection.router` ARC
 adapter calls a separately launched local worker that owns encoder and head
 inference. It uses the existing
