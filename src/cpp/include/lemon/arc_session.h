@@ -145,11 +145,13 @@ inline void validate_arc_session_receipt(const json& config, const ArcSessionCon
                 "ARC session owner/package mismatch");
     arc_require(receipt.at("source_request_format") == format, "ARC session source format mismatch");
     if (receipt.at("request_format") != format) {
-        arc_require(format == "anthropic_messages" && receipt.at("request_format") == "openai_chat" &&
+        const auto destination = receipt.at("request_format").get<std::string>();
+        arc_require(((format == "anthropic_messages" && destination == "openai_chat") ||
+                     (format == "openai_chat" && destination == "anthropic_messages")) &&
                     !session.codec_sha256.empty(), "ARC cross-format dispatch requires an opted-in pinned codec");
         const auto& codec = receipt.at("response_codec");
         arc_require(codec == json({{"schema_version", "rayline.arc.response-codec.v1"},
-            {"source", "openai_chat"}, {"target", "anthropic_messages"},
+            {"source", destination}, {"target", format},
             {"implementation_sha256", session.codec_sha256}}), "ARC response codec binding mismatch");
     }
     const auto action = receipt.at("action_id").get<std::string>();
@@ -209,6 +211,7 @@ public:
         }
         return valid_;
     }
+    bool finished() const { return valid_ && finished_; }
     bool terminal() const { return valid_ && done_ && finished_; }
     json messages() const {
         if (!terminal() || !known_) return nullptr;

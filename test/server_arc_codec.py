@@ -12,6 +12,12 @@ from utils.server_base import ServerTestBase, run_server_tests
 
 class ArcCodecTests(ServerTestBase):
     def test_prepared_chat_return_codec(self):
+        self._prepared_return_codec(False)
+
+    def test_prepared_native_return_codec(self):
+        self._prepared_return_codec(True)
+
+    def _prepared_return_codec(self, native_provider):
         package = {"alias": "synthetic", "package_sha256": "b" * 64}
         action, pin = "a" * 64, "e" * 64
         state = {"wire": [], "prepared": [], "settled": [], "codec": []}
@@ -26,6 +32,37 @@ class ArcCodecTests(ServerTestBase):
             "stop_reason": "end_turn",
             "usage": {"input_tokens": 2, "output_tokens": 1},
         }
+
+        chat = {
+            "id": "chat-test",
+            "object": "chat.completion",
+            "model": "worker",
+            "choices": [
+                {
+                    "index": 0,
+                    "message": {"role": "assistant", "content": "done"},
+                    "finish_reason": "stop",
+                }
+            ],
+        }
+        chat_frames = [
+            "data: "
+            + json.dumps(
+                {
+                    "choices": [
+                        {
+                            "index": 0,
+                            "delta": {"role": "assistant", "content": "done"},
+                            "finish_reason": "stop",
+                        }
+                    ]
+                }
+            )
+            + "\n\n",
+            "data: [DONE]\n\n",
+        ]
+        source_format = "openai_chat" if native_provider else "anthropic_messages"
+        target_format = "anthropic_messages" if native_provider else "openai_chat"
 
         def frame(kind, **fields):
             return (
@@ -75,7 +112,10 @@ class ArcCodecTests(ServerTestBase):
                         ],
                         "stream": body["request"].get("stream", False),
                     }
-                    if prepared["stream"]:
+                    if native_provider:
+                        prepared["max_tokens"] = 100
+                        prepared["thinking"] = {"type": "adaptive"}
+                    if prepared["stream"] and not native_provider:
                         prepared["stream_options"] = {"include_usage": True}
                     state["prepared"].append(prepared)
                     self.reply(
@@ -83,8 +123,8 @@ class ArcCodecTests(ServerTestBase):
                             "owner_id": "codec-host",
                             "package_sha256": package["package_sha256"],
                             "action_id": action,
-                            "source_request_format": "anthropic_messages",
-                            "request_format": "openai_chat",
+                            "source_request_format": source_format,
+                            "request_format": target_format,
                             "request": prepared,
                             "transaction_id": body["operation_id"],
                             "session_token": body["operation_id"],
@@ -92,8 +132,8 @@ class ArcCodecTests(ServerTestBase):
                             "context_epoch": "0",
                             "response_codec": {
                                 "schema_version": "rayline.arc.response-codec.v1",
-                                "source": "openai_chat",
-                                "target": "anthropic_messages",
+                                "source": target_format,
+                                "target": source_format,
                                 "implementation_sha256": pin,
                             },
                             "decision": {
@@ -112,11 +152,19 @@ class ArcCodecTests(ServerTestBase):
                     operation = body["operation"]
                     result = {"implementation_sha256": pin}
                     if operation == "response":
-                        result["body"] = native
+                        result["body"] = chat if native_provider else native
                     elif operation in ("stream_push", "stream_finish"):
-                        result["frames"] = (
-                            frames if "[DONE]" in body.get("frame", "") else []
-                        )
+                        if native_provider:
+                            event = body.get("frame", "")
+                            result["frames"] = (
+                                [chat_frames[0]]
+                                if "message_delta" in event
+                                else [chat_frames[1]] if "message_stop" in event else []
+                            )
+                        else:
+                            result["frames"] = (
+                                frames if "[DONE]" in body.get("frame", "") else []
+                            )
                     self.reply(result)
                 elif self.path.endswith(("/commit", "/abort")):
                     operation = self.path.rsplit("/", 1)[-1]
@@ -126,6 +174,10 @@ class ArcCodecTests(ServerTestBase):
                     )
                 else:
                     state["wire"].append(body)
+                    state.setdefault("provider_headers", []).append(
+                        {key.lower(): value for key, value in self.headers.items()}
+                    )
+                    state.setdefault("provider_paths", []).append(self.path)
                     response = {
                         "id": "chat-test",
                         "object": "chat.completion",
@@ -139,7 +191,7 @@ class ArcCodecTests(ServerTestBase):
                         ],
                     }
                     if not body.get("stream"):
-                        self.reply(response)
+                        self.reply(native if native_provider else response)
                         return
                     self.send_response(200)
                     self.send_header("Content-Type", "text/event-stream")
@@ -156,6 +208,8 @@ class ArcCodecTests(ServerTestBase):
                     raw = (
                         "data: " + json.dumps(event) + "\n\ndata: [DONE]\n\n"
                     ).encode()
+                    if native_provider:
+                        raw = "".join(frames).encode()
                     try:
                         for part in (raw[:7], raw[7:-1], raw[-1:]):
                             self.wfile.write(part)
@@ -178,6 +232,7 @@ class ArcCodecTests(ServerTestBase):
                     "backend": "cloud",
                     "provider": "testarccodec",
                     "base_url": origin + "/v1",
+                    "wire_format": "anthropic" if native_provider else "openai",
                     "allow_insecure_http": True,
                 },
             ),
@@ -257,7 +312,9 @@ class ArcCodecTests(ServerTestBase):
             "max_tokens": 100,
             "messages": [{"role": "user", "content": "hello"}],
         }
-        endpoint = self.base_url.removesuffix("/api/v1") + "/v1/messages"
+        endpoint = self.base_url.removesuffix("/api/v1") + (
+            "/v1/chat/completions" if native_provider else "/v1/messages"
+        )
         for streaming in (False, True):
             body = copy.deepcopy(source)
             body["stream"] = streaming
@@ -272,10 +329,27 @@ class ArcCodecTests(ServerTestBase):
             )
             self.assertEqual(response.status_code, 200, response.text)
             if streaming:
-                self.assertIn("message_stop", response.text)
+                self.assertIn(
+                    "[DONE]" if native_provider else "message_stop", response.text
+                )
             else:
-                self.assertEqual(response.json(), native)
+                actual = response.json()
+                actual.pop("x_lemonade_route", None)
+                self.assertEqual(actual, chat if native_provider else native)
             self.assertEqual(state["wire"][-1], state["prepared"][-1])
+            self.assertEqual(
+                state["provider_headers"][-1]["authorization"],
+                "Bearer synthetic-noncredential",
+            )
+            self.assertTrue(
+                state["provider_paths"][-1].endswith(
+                    "/messages" if native_provider else "/chat/completions"
+                )
+            )
+            if native_provider:
+                self.assertEqual(
+                    state["provider_headers"][-1]["anthropic-version"], "2023-06-01"
+                )
         release.set()
         # A new prepare cannot pass the session gate before the prior commit ACK.
         response = requests.post(
@@ -291,7 +365,12 @@ class ArcCodecTests(ServerTestBase):
         self.assertTrue(all(kind == "commit" for kind, _ in state["settled"]))
         self.assertEqual(
             state["settled"][1][1]["response_messages"],
-            [{"role": "assistant", "content": native["content"]}],
+            [
+                {
+                    "role": "assistant",
+                    "content": "done" if native_provider else native["content"],
+                }
+            ],
         )
         self.assertTrue(
             all(

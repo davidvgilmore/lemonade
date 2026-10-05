@@ -1,9 +1,10 @@
 #include "lemon/arc_chat_frames.h"
-#include "lemon/arc_session.h"
 #include "lemon/arc_messages.h"
+#include "lemon/arc_native_chat.h"
+#include "lemon/arc_session.h"
 
-#include <stdexcept>
 #include <iostream>
+#include <stdexcept>
 
 using namespace lemon;
 
@@ -12,6 +13,70 @@ static void require(bool condition) {
 }
 
 int main() {
+    const std::string action(64, 'a'), pin(64, 'b');
+    const json config = {{"package", {{"alias", "fixture"}, {"package_sha256", pin}}},
+                         {"actions", {{action, {{"wire_model", "native-model"}}}}}};
+    const ArcSessionConfig session{"http://127.0.0.1:9/session", "owner", pin};
+    const json source = {{"messages", json::array()}, {"model", "router"}, {"stream", false}};
+    json receipt = {{"owner_id", "owner"}, {"package_sha256", pin},
+        {"source_request_format", "openai_chat"}, {"request_format", "anthropic_messages"},
+        {"response_codec", {{"schema_version", "rayline.arc.response-codec.v1"},
+            {"source", "anthropic_messages"}, {"target", "openai_chat"}, {"implementation_sha256", pin}}},
+        {"action_id", action}, {"transaction_id", "transaction"}, {"session_token", "token"},
+        {"episode_id_hash", "episode"}, {"context_epoch", "0"},
+        {"request", {{"messages", json::array()}, {"model", "native-model"}}},
+        {"decision", {{"schema_version", "rayline.arc.policy-decision-response.v1"},
+            {"package", config.at("package")}, {"decision", {{"selected_action_id", action}, {"selected_arm_id", pin}}},
+            {"encoding", {{"session_revision", 1}}}}}};
+    validate_arc_session_receipt(config, session, receipt, source);
+    for (const auto* key : {"source", "target", "implementation_sha256"}) {
+        auto wrong = receipt;
+        wrong["response_codec"][key] = "wrong";
+        bool refused = false;
+        try { validate_arc_session_receipt(config, session, wrong, source); }
+        catch (const std::exception&) { refused = true; }
+        require(refused);
+    }
+    auto reverse = receipt;
+    reverse["source_request_format"] = "anthropic_messages";
+    reverse["request_format"] = "openai_chat";
+    reverse["response_codec"]["source"] = "openai_chat";
+    reverse["response_codec"]["target"] = "anthropic_messages";
+    validate_arc_session_receipt(config, session, reverse, source, "anthropic_messages");
+
+    ArcMessagesFrames native_frames;
+    const std::string native_complete =
+        "data: {\"type\":\"message_start\",\"message\":{\"role\":\"assistant\",\"content\":[]}}\r\n\r\n"
+        "data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"}}\n\n"
+        "data: {\"type\":\"message_stop\"}\n";
+    int native_count = 0;
+    const auto native_emit = [&](const std::string&, bool) { ++native_count; return true; };
+    for (const auto byte : native_complete) require(native_frames.accept(&byte, 1, native_emit));
+    require(native_count == 2 && !native_frames.terminal());
+    require(native_frames.accept("\n", 1, native_emit) && native_frames.terminal() && native_count == 3);
+
+    const std::string final_chat = "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"answer\"},\"finish_reason\":\"stop\"}]}\n\n";
+    ArcChatCodecDelivery delivery;
+    std::string written;
+    const auto write = [&](const char* data, size_t size) { written.append(data, size); return true; };
+    require(delivery.deliver(json::object(), false, write)); // stream_start may omit frames.
+    require(delivery.deliver({{"frames", {final_chat, "data: [DONE]\n\n"}}}, false, write));
+    require(!delivery.accepted_terminal() && written.empty());
+    require(delivery.deliver({{"frames", json::array()}}, true, write));
+    require(delivery.accepted_terminal() && delivery.messages().at(0).at("content") == "answer");
+    ArcChatCodecDelivery dropped;
+    require(dropped.deliver({{"frames", {final_chat}}}, false, write));
+    require(!dropped.deliver({{"frames", {"data: [DONE]\n\n"}}}, true,
+        [](const char*, size_t) { return false; }));
+    require(!dropped.accepted_terminal());
+    ArcChatCodecDelivery trailing;
+    require(trailing.deliver({{"frames", {final_chat}}}, false, write));
+    written.clear();
+    require(!trailing.deliver({{"frames", {"data: [DONE]\n\n", final_chat}}}, true, write));
+    require(!trailing.accepted_terminal() && written.find("[DONE]") == std::string::npos);
+    ArcChatCodecDelivery oversized;
+    require(!oversized.deliver({{"frames", {std::string(16 * 1024 * 1024 + 1, 'x')}}}, false, write));
+
     ArcChatFrames frames;
     const std::string complete = "data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n";
     size_t count = 0;

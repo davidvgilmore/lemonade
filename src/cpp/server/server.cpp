@@ -2,6 +2,7 @@
 #include "lemon/api_docs.h"
 #include "lemon/arc_router.h"
 #include "lemon/arc_session.h"
+#include "lemon/anthropic_upstream.h"
 #include "lemon/prepared_request.h"
 #include "lemon/audio_types.h"
 #include "lemon/auto_tune.h"
@@ -4027,6 +4028,22 @@ void Server::handle_chat_completions(const httplib::Request& req, httplib::Respo
                             route_dispatch->requested_model = requested_model;
                             LOG(INFO, "Server") << "Router collection '" << requested_model
                                                 << "' -> '" << route_dispatch->selected_model << "'" << std::endl;
+                            if (route_dispatch->prepared_session &&
+                                route_dispatch->prepared_session->receipt().at("request_format") == "anthropic_messages") {
+                                auto prepared = route_dispatch->prepared_session;
+                                try {
+                                    auto match = resolve_anthropic_upstream(model_manager_.get(),
+                                        route_dispatch->selected_model, prepared->request(), req, true);
+                                    arc_require(match.claimed && match.upstream.has_value(),
+                                        match.error_message.empty() ? "ARC selected destination is not a registered native Messages cloud provider" : match.error_message);
+                                    attach_route_header(res, route_dispatch->decision);
+                                    forward_arc_messages_as_chat(std::move(*match.upstream), prepared, res,
+                                        route_decision_to_json(route_dispatch->decision), req.is_connection_closed);
+                                } catch (const std::exception&) {
+                                    throw ArcRoutingError("ARC native provider or return codec failed");
+                                }
+                                return;
+                            }
                             if (route_dispatch->prepared_session) request_json = route_dispatch->prepared_session->request();
                             else apply_arc_dispatch(request_json, route_dispatch->decision);
                             request_json["model"] = route_dispatch->selected_model;

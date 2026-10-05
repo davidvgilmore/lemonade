@@ -345,6 +345,35 @@ parity, real Qwen inference, or the local llama.cpp subprocess seam. Those requi
 separate composition evidence against the selected package, codec and runtime.
 Responses ingress remains unsupported by session collections.
 
+### Chat sessions with a prepared native Messages provider
+
+The same opt-in `codec_sha256` contract supports ordinary Chat clients, including
+the desktop chat panel, when the selected registered cloud provider uses the
+Anthropic wire format. The receipt retains `source_request_format: openai_chat`,
+sets `request_format: anthropic_messages`, and binds the return codec with
+`source: anthropic_messages` and `target: openai_chat`. Its implementation hash
+must equal the configured codec hash. No renderer protocol setting is needed.
+
+Lemonade resolves the selected registration's exact checkpoint and uses its
+existing authentication, HTTP security policy, cancellation and native transport.
+It sends the prepared Messages body unchanged. The session service owns request
+conversion, native controls, private append, usage presence and reasoning
+translation. The host neither infers controls from action names nor invents usage
+or cache counters. An unsupported selected destination refuses the request.
+
+Buffered provider success passes through the bound return codec before delivery.
+For streaming, complete native events are translated incrementally; Chat finish-reason
+frames and `[DONE]` are withheld until a valid native `message_stop` and codec
+finalization. Settlement
+records the exact delivered Chat assistant message only after its terminal is
+accepted by the client transport. Provider stalls after that terminal do not delay
+settlement. Incomplete native events, codec failures and earlier disconnects abort;
+settlement acknowledgment failures retain the existing unresolved-session fence.
+
+The reciprocal case is part of `test/server_arc_codec.py`. A passing transport
+fixture alone does not qualify the private codec, a real cloud provider, numerical
+ARC parity, or a desktop demonstration. These require their own composed evidence.
+
 ### Start an installed session runtime
 
 If your ARC deployment supplies a separate session-runtime bundle, install its
