@@ -130,6 +130,15 @@ export function buildLemonadeTools(
   return { tools, systemPrompt, models };
 }
 
+export const serverChatTools: LemonadeToolDef[] = [{
+  type: 'function',
+  function: {
+    name: 'lemonade_list_models',
+    description: 'List models registered on this Lemonade server. This does not load, download or run a model.',
+    parameters: { type: 'object', properties: {}, additionalProperties: false },
+  },
+}];
+
 /**
  * Execute a single Lemonade tool call.
  */
@@ -141,6 +150,18 @@ export async function executeLemonadeTool(
   signal?: AbortSignal,
 ): Promise<ToolExecutionResult> {
   const funcName = toolCall.function.name;
+  if (funcName === 'lemonade_list_models') {
+    const args = JSON.parse(toolCall.function.arguments);
+    if (!args || typeof args !== 'object' || Array.isArray(args) || Object.keys(args).length) {
+      throw new Error('lemonade_list_models accepts an empty arguments object');
+    }
+    const response = await serverFetch('/models', { signal });
+    if (!response.ok) throw new Error(`Unable to list models: HTTP ${response.status}`);
+    const body = await response.json();
+    if (!Array.isArray(body.data)) throw new Error('Invalid model list response');
+    return { type: 'text', text: JSON.stringify({ models: body.data.map((item: any) => ({ id: item.id })) }) };
+  }
+
   let args: Record<string, any>;
   try {
     args = JSON.parse(toolCall.function.arguments);

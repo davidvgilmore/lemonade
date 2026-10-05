@@ -423,3 +423,29 @@ for reconciliation; restarting or changing a session ID does not prove it safe t
 retry. Numerical ARC parity, durable recovery, Responses ingress and real-provider
 cache behavior remain separate acceptance requirements. This setup is an
 experimental integration, not a claim that the whole deployment is launch-ready.
+
+Ordinary desktop and browser Chat on a router collection can use the read-only
+`lemonade_list_models` tool to answer questions about models registered on the
+connected server. It reads the existing authenticated model-list endpoint; it
+never downloads, loads or runs a model. This is the only tool currently advertised
+by ordinary router Chat. Multimodal collections keep their existing capability
+selection and media executors; this does not add arbitrary filesystem or MCP tools.
+
+Chat retains completed assistant and tool messages separately from displayed
+text, including reasoning fields needed by a prepared native transport. A tool-only
+response can continue, with at most five Chat requests and five tool executions per user turn. Calls
+beyond the execution limit receive an explicit failure result. Unknown
+tools and invalid arguments fail without execution. Aborted or incomplete streams
+are not carried into later requests; completed prefixes and tool failure results
+remain in history. No tool is automatically retried. Invalid or duplicate tool
+identities require a new chat rather than sending malformed history. A new chat
+is a new context, not recovery of an uncertain server settlement.
+
+Renderer source tests and builds do not establish a live UI/provider composition.
+The reciprocal private codec and its history retention must be qualified on the
+exact installed runtime; provider usage and private native signatures must not be
+inferred from displayed text.
+
+Earlier router messages cannot be edited after an assistant turn completes: start
+a new chat to change the prompt. Signed history belongs to its original session;
+the UI does not silently create a new session while carrying that history.
