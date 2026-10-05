@@ -131,6 +131,16 @@ ProcessHandle MacOSProcessPlatform::spawn(
     posix_spawn_file_actions_t file_actions;
     posix_spawn_file_actions_init(&file_actions);
 
+    // CLOEXEC_DEFAULT closes even standard descriptors unless a file action
+    // explicitly preserves them. Interactive agents need stdin as well as output.
+    if (inherit_output) {
+        posix_spawn_file_actions_addinherit_np(&file_actions, STDIN_FILENO);
+        if (!filter_health_logs) {
+            posix_spawn_file_actions_addinherit_np(&file_actions, STDOUT_FILENO);
+            posix_spawn_file_actions_addinherit_np(&file_actions, STDERR_FILENO);
+        }
+    }
+
     if (inherit_output && filter_health_logs) {
         posix_spawn_file_actions_addclose(&file_actions, stdout_pipe[0]);
         posix_spawn_file_actions_addclose(&file_actions, stderr_pipe[0]);

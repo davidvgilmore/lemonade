@@ -7,6 +7,11 @@
 #include <fstream>
 #include <iostream>
 #include <string>
+#include <thread>
+#ifndef _WIN32
+#include <fcntl.h>
+#include <unistd.h>
+#endif
 
 namespace fs = std::filesystem;
 
@@ -23,6 +28,13 @@ std::string env(const lemon_tray::AgentConfig& config, const std::string& key) {
 }
 
 int main(int argc, char** argv) {
+    if (argc > 1 && std::string(argv[1]) == "--stdio-probe") {
+        std::string line;
+        std::getline(std::cin, line);
+        std::cout << "STDOUT_MARKER:" << line << std::endl;
+        std::cerr << "STDERR_MARKER" << std::endl;
+        return line == "STDIN_MARKER" && std::cout.good() && std::cerr.good() ? 0 : 3;
+    }
     if (argc > 1 && std::string(argv[1]) == "--probe") {
         const char* home = std::getenv("HOME");
         const char* cap = std::getenv("CLAUDE_CODE_MAX_CONTEXT_TOKENS");
@@ -89,6 +101,55 @@ int main(int argc, char** argv) {
     else lemon::utils::ProcessManager::reap_process(child);
 #endif
     check("actual child receives empty argv and isolated environment", child_exit == 0);
+#ifndef _WIN32
+    // Exercise actual spawn inheritance, filtering and output suppression.
+    for (int mode = 0; mode < 3; ++mode) {
+        std::ofstream(parent / "stdin") << "STDIN_MARKER\n";
+        std::cout.flush(); std::cerr.flush();
+        const int saved[] = {dup(0), dup(1), dup(2)};
+        const int input = open((parent / "stdin").c_str(), O_RDONLY);
+        const int output = open((parent / "stdout").c_str(), O_WRONLY | O_CREAT | O_TRUNC, 0600);
+        const int errors = open((parent / "stderr").c_str(), O_WRONLY | O_CREAT | O_TRUNC, 0600);
+        if (input < 0 || output < 0 || errors < 0 || saved[0] < 0 || saved[1] < 0 || saved[2] < 0) return 1;
+        dup2(input, 0); dup2(output, 1); dup2(errors, 2);
+        close(input); close(output); close(errors);
+        auto stdio_child = lemon::utils::ProcessManager::start_process(
+            fs::absolute(argv[0]).string(), {"--stdio-probe"}, "", mode != 2, mode == 1, {});
+        const int stdio_exit = lemon::utils::ProcessManager::wait_for_exit(stdio_child, 5);
+        if (stdio_exit == -1) lemon::utils::ProcessManager::kill_process(stdio_child);
+        // Filter readers are detached: process exit alone does not prove log drain.
+        // Keep the captured descriptors active until both markers arrive or bounded refusal.
+        if (mode == 1 && stdio_exit == 0) {
+            const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(1);
+            while (true) {
+                std::ifstream out(parent / "stdout"), err(parent / "stderr");
+                const std::string observed = std::string(std::istreambuf_iterator<char>(out), {})
+                    + std::string(std::istreambuf_iterator<char>(err), {});
+                if (observed.find("STDOUT_MARKER:STDIN_MARKER") != std::string::npos
+                    && observed.find("STDERR_MARKER") != std::string::npos) break;
+                if (std::chrono::steady_clock::now() >= deadline) break;
+                std::this_thread::sleep_for(std::chrono::milliseconds(1));
+            }
+        }
+        std::cout.flush(); std::cerr.flush();
+        for (int fd = 0; fd < 3; ++fd) { dup2(saved[fd], fd); close(saved[fd]); }
+        std::cout << "Synthetic stdio child PID " << stdio_child.pid << " exit " << stdio_exit << std::endl;
+        std::ifstream stdout_file(parent / "stdout"), stderr_file(parent / "stderr");
+        const std::string stdout_text((std::istreambuf_iterator<char>(stdout_file)), {});
+        const std::string stderr_text((std::istreambuf_iterator<char>(stderr_file)), {});
+        const auto combined = stdout_text + stderr_text;
+        if (mode == 2) {
+            check("suppressed child output stays suppressed", stdio_exit != -1
+                  && combined.find("STDOUT_MARKER") == std::string::npos
+                  && combined.find("STDERR_MARKER") == std::string::npos);
+        } else {
+            check(mode == 0 ? "actual inherited stdin stdout stderr survive spawn"
+                            : "filtered output preserves stdin and both output streams", stdio_exit == 0
+                  && (mode == 0 ? stdout_text : combined).find("STDOUT_MARKER:STDIN_MARKER") != std::string::npos
+                  && (mode == 0 ? stderr_text : combined).find("STDERR_MARKER") != std::string::npos);
+        }
+    }
+#endif
     std::ofstream(root / "sentinel") << "keep";
     check("reuse refuses and preserves existing files", !lemon_tray::prepare_claude_profile(options, error)
           && fs::file_size(root / "sentinel") == 4);
