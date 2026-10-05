@@ -13,6 +13,9 @@ const SETTINGS_FILE_NAME: &str = "app_settings.json";
 
 // ---------- Default values ----------
 
+fn default_max_output_tokens() -> i64 {
+    4096
+}
 fn default_temperature() -> f64 {
     0.7
 }
@@ -140,6 +143,7 @@ pub struct ModelManagerSettings {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct AppSettings {
+    pub max_output_tokens: TypedSetting,
     pub temperature: TypedSetting,
     pub top_k: TypedSetting,
     pub top_p: TypedSetting,
@@ -161,6 +165,10 @@ pub struct AppSettings {
 impl Default for AppSettings {
     fn default() -> Self {
         AppSettings {
+            max_output_tokens: TypedSetting {
+                value: Value::from(default_max_output_tokens()),
+                use_default: true,
+            },
             temperature: TypedSetting {
                 value: json_num(default_temperature()),
                 use_default: true,
@@ -312,6 +320,13 @@ fn extract_clamped_i64(min: i64, max: i64) -> impl Fn(&Value) -> Option<Value> {
 /// byte-for-byte so renderer state round-trips without drift.
 pub(crate) fn sanitize_app_settings(incoming: &Value) -> AppSettings {
     let mut s = AppSettings::default();
+
+    apply_typed_setting(
+        incoming,
+        "maxOutputTokens",
+        &mut s.max_output_tokens,
+        extract_clamped_i64(1, 1_048_576),
+    );
 
     apply_typed_setting(
         incoming,
@@ -553,9 +568,16 @@ mod tests {
         let mut settings = serde_json::to_value(read_settings_file(&path, Some(&profile))).unwrap();
         assert_eq!(settings["baseURL"]["value"], profile.server_url);
         assert_eq!(settings["baseURL"]["useDefault"], false);
+        settings["maxOutputTokens"] = json!({"value": 8192, "useDefault": false});
         settings["layout"]["theme"] = Value::String("light".into());
         write_settings_file(&path, &settings, Some(&profile)).unwrap();
         let before = fs::read(&path).unwrap();
+        let reopened = serde_json::to_value(read_settings_file(&path, Some(&profile))).unwrap();
+        assert_eq!(reopened["maxOutputTokens"], settings["maxOutputTokens"]);
+        assert_eq!(
+            reopened["temperature"],
+            json!({"value": 0.7, "useDefault": true})
+        );
         assert_eq!(
             read_settings_file(&path, Some(&profile)).layout.theme,
             "light"
@@ -665,6 +687,42 @@ mod tests {
             .pointer("/modelManager/showDownloadedOnly")
             .and_then(|v| v.as_bool());
         assert_eq!(show_downloaded_only, Some(true));
+    }
+
+    #[test]
+    fn max_output_tokens_sanitizes_like_renderer_integer_settings() {
+        for (value, expected) in [
+            (json!(0), 1),
+            (json!(1_048_577), 1_048_576),
+            (json!(512.6), 513),
+            (json!("8192"), 4096),
+            (json!(true), 4096),
+            (Value::Null, 4096),
+        ] {
+            let settings = sanitize_app_settings(&json!({
+                "maxOutputTokens": {"value": value, "useDefault": false}
+            }));
+            assert_eq!(settings.max_output_tokens.value, json!(expected));
+            assert!(!settings.max_output_tokens.use_default);
+        }
+        for incoming in [
+            json!({}),
+            json!({
+                "maxOutputTokens": {"value": 8192, "useDefault": true}
+            }),
+        ] {
+            let settings = serde_json::to_value(sanitize_app_settings(&incoming)).unwrap();
+            assert_eq!(
+                settings["maxOutputTokens"],
+                json!({"value": 4096, "useDefault": true})
+            );
+            assert_eq!(settings["topK"], json!({"value": 40, "useDefault": true}));
+            assert_eq!(settings["topP"], json!({"value": 0.9, "useDefault": true}));
+            assert_eq!(
+                settings["repeatPenalty"],
+                json!({"value": 1.1, "useDefault": true})
+            );
+        }
     }
 
     #[test]
